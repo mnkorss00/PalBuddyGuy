@@ -23,7 +23,9 @@ HELP = """commands:
   fastcal            calibrate max power by puppeting the avatar
   stop               stop inference / training / recording
   arch [standard|lite]  model size used for the next training
+  vrcft [status|install|uninstall]  VRCFaceTracking v6 module
   perf [engine auto|onnx|pytorch] [device auto|cpu|gpu] [threads N] [int8 on|off] [rate HZ]
+       [priority above_normal|normal|below_normal|idle] [affinity all|ecores] [eco on|off]
                      show / change inference performance settings
   bench              compare CPU fp32 / CPU int8 / GPU on this PC
   stats              frame rate over 5 seconds
@@ -102,15 +104,39 @@ def run_cli(engine):
                         c.infer_int8 = value.lower() in ("on", "1", "true", "yes")
                     elif key == "rate":
                         c.max_infer_rate = max(0.0, float(value))
+                    elif key == "priority" and value in ("above_normal", "normal", "below_normal", "idle"):
+                        c.process_priority = value
+                    elif key == "affinity" and value in ("all", "ecores"):
+                        c.cpu_affinity = value
+                    elif key == "eco":
+                        c.efficiency_mode = value.lower() in ("on", "1", "true", "yes")
                     else:
                         raise ValueError("unknown perf setting %s %s" % (key, value))
                 if words:
+                    from . import system
+                    system.apply(c)
                     engine.save_config()
                     engine.restart_inference()
+                print("priority %s  affinity %s  eco %s" % (
+                    c.process_priority, c.cpu_affinity, "on" if c.efficiency_mode else "off"))
                 print("engine %s  device %s  threads %d  int8 %s  rate %s  (running: %s)" % (
                     c.infer_engine, c.infer_device, c.infer_threads, "on" if c.infer_int8 else "off",
                     "%.0f Hz" % c.max_infer_rate if c.max_infer_rate else "every frame",
                     engine.infer_backend or "not tracking"))
+            elif cmd == "vrcft":
+                from . import vrcft_install
+                action = arg or "status"
+                if action == "install":
+                    print("\n".join(vrcft_install.install(engine.cfg)))
+                elif action == "uninstall":
+                    print("\n".join(vrcft_install.uninstall(engine.cfg)))
+                else:
+                    st = vrcft_install.status(engine.cfg)
+                    print("CustomLibs: %s" % st["custom_libs"])
+                    print("installed: %s (available %s)" % (st["installed_version"] or "no", st["available_version"]))
+                    for m in st["sranipal"]:
+                        print("SRanipal module: %s (%s)" % (m["name"], "wrapped" if m["disabled"] else "standalone"))
+                    print("connected module protocol: %s" % engine.vrcft.protocol)
             elif cmd == "arch":
                 if arg:
                     if arg not in ("standard", "lite"):
@@ -215,6 +241,8 @@ def main(argv=None):
         return 1
     for problem in cfg.validate():
         log.warning(problem)
+    from . import system
+    system.apply(cfg)
 
     # Idle OpenMP worker threads otherwise busy-spin for a while after every op,
     # burning CPU that VRChat could use. Must be set before torch is imported.

@@ -9,7 +9,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 
-from .params import shape_id
+from .params import is_valid_target
 
 # config.json lives next to script.py / PalBuddyGuy.bat, independent of the working directory
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -77,6 +77,10 @@ class Config:
     # Inference
     smoothing: float = 0.0  # 0 = off, otherwise EMA factor in (0, 1)
     max_send_rate: float = 120.0  # Hz cap for VRCFT updates
+    # VRCFT v6 module: "replace" SRanipal's value of a driven shape, or keep the "max" of both
+    vrcft_override_mode: str = "replace"
+    vrcft_wrap_sranipal: bool = True  # module installer: run SRanipal inside the PalBuddyGuy module
+    vrcft_custom_libs: str = ""  # VRCFT modules folder; empty = %APPDATA%\VRCFaceTracking\CustomLibs
     # "auto": ONNX Runtime if installed, else PyTorch. ONNX Runtime is faster on the
     # CPU (int8) and tracking with it never loads PyTorch (~500 MB less RAM).
     infer_engine: str = "auto"  # "auto", "onnx" or "pytorch"
@@ -84,6 +88,12 @@ class Config:
     infer_threads: int = 1  # CPU threads for inference; more = lower latency but more total CPU
     infer_int8: bool = True  # int8-quantize the linear layers when inferring on the CPU
     max_infer_rate: float = 0.0  # Hz cap for running the network, 0 = every new frame
+
+    # Process placement (see palbuddy/system.py). Tracking needs little CPU, so by
+    # default it yields to VR / the game when the CPU is busy.
+    process_priority: str = "below_normal"  # "above_normal", "normal", "below_normal", "idle"
+    cpu_affinity: str = "all"  # "all" or "ecores" (hybrid Intel CPUs: efficiency cores only)
+    efficiency_mode: bool = False  # Windows 11 EcoQoS
 
     # GUI
     language: str = "auto"  # "auto", "en" or "ko"
@@ -97,11 +107,12 @@ class Config:
         return len(self.classes)
 
     def targets(self):
-        """[(class_index, shape_index, max_power)] for every class that drives a shape."""
+        """[(class_index, target_name, max_power)] for every class that drives a shape.
+        Target names are SRanipal lip shapes or Unified Expressions (see params.py)."""
         out = []
         for i, c in enumerate(self.classes):
-            if c.target not in (None, ""):
-                out.append((i, shape_id(c.target), c.max_power))
+            if c.target not in (None, "") and is_valid_target(c.target):
+                out.append((i, c.target, c.max_power))
         return out
 
     def dataset_path(self, filename):
@@ -119,9 +130,7 @@ class Config:
             problems.append("No expression classes are configured.")
         for c in self.classes:
             if c.target not in (None, ""):
-                try:
-                    shape_id(c.target)
-                except KeyError:
+                if not is_valid_target(c.target):
                     problems.append("Class '%s' has an unknown target shape '%s'." % (c.name, c.target))
             if c.max_power <= 0:
                 problems.append("Class '%s' needs max_power > 0." % c.name)

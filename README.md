@@ -107,6 +107,20 @@ Idle worker threads are also told not to busy-wait (`OMP_WAIT_POLICY=PASSIVE`, a
 ### Tracking on a PC without PyTorch
 Copy `config.json`, `buddyguy.onnx`, `buddyguy.int8.onnx` and `buddyguy.json` next to the app, then `pip install numpy onnxruntime`. Tracking works without PyTorch; only training needs it.
 
+## 6. VRCFaceTracking (Settings tab → VRCFaceTracking module)
+For **VRCFaceTracking v6**, install the module from the app with **Install / update**, then restart VRCFaceTracking. The status bar shows *VRCFaceTracking: connected (v6 module)*.
+
+* VRCFaceTracking v6 lets only one module provide eye tracking and one provide expressions, so the Pal Buddy Guy module **runs the SRanipal module inside itself**. The installer disables the standalone SRanipal module by renaming its `module.json`, and **Remove** restores it. Install the SRanipal module in VRCFaceTracking first.
+* A class's *Drives shape* can be an SRanipal lip shape (as before) or any **Unified Expression**, including eye-area shapes like `BrowLowererLeft` or `EyeSquintRight` that SRanipal can't express. For example, you can train a frown seen by the Pro Eye cameras.
+* By default Pal Buddy Guy's value replaces SRanipal's for the shapes it drives. *Keep SRanipal's value when it is larger* switches to the maximum of the two.
+* When tracking stops, the module falls back to plain SRanipal within 0.5 s.
+* The original VRCFaceTracking module (≤ v4) still works; it only understands SRanipal lip shapes.
+
+Details, the protocol and how to build or test the module: [`vrcft-module/README.md`](vrcft-module/README.md).
+
+## 7. Process priority (Settings tab → Inference performance)
+Tracking needs very little CPU, so by default the process runs at **below normal** priority and yields to VR and the game when the CPU is busy. On hybrid Intel CPUs (12th gen and later, e.g. the i7-12700K), **Efficiency cores only** keeps it off the P-cores entirely. On Windows 11, **Efficiency mode** (EcoQoS) lets the scheduler run it on slow, low-power cores. *low* priority is available too, but tracking may stutter when the CPU is fully loaded.
+
 # What changed compared to the original scripts
 **GUI**
 * Tkinter GUI (no extra dependencies) with live connection status, camera preview, output meters, recording with progress, a class/dataset editor, training with a live loss chart and ETA, FastCal, and settings. Available in English and Korean.
@@ -148,5 +162,7 @@ If you want the receiver in its own process, run `python tvm_proxy.py` and set t
 7. **실시간** 탭: *트래킹 시작*을 누른 뒤 *빠른 보정(FastCal)*으로 아바타를 따라 하며 보정합니다.
 
 8. **설정 탭 → 추론 성능**: 기본값(자동: ONNX Runtime, CPU int8)으로도 가볍게 돌아갑니다. *이 PC에서 비교 측정*을 누르면 CPU/GPU/ONNX 중 어느 쪽이 이 PC에 맞는지 바로 확인할 수 있습니다. 학습 탭에서 *모델 크기 → 경량*을 고르면 추론이 약 5배 빨라집니다. 표준 모델과 검증 정확도를 비교해 보고 결정하세요.
+9. **설정 탭 → VRCFaceTracking 모듈 → 설치**: VRCFaceTracking v6용 모듈을 설치합니다. 먼저 VRCFaceTracking에서 SRanipal 모듈을 설치해 두세요. 설치하면 SRanipal 모듈은 Pal Buddy Guy 모듈 안에서 실행됩니다. v6는 눈과 표정을 각각 모듈 하나만 담당할 수 있기 때문입니다. 설치 후 VRCFaceTracking을 다시 시작하세요. *제거*를 누르면 원래대로 돌아갑니다. 대상 파라미터로 `BrowLowererLeft` 같은 **눈썹/눈 주변 표정**도 고를 수 있습니다.
+10. **프로세스 우선순위**: 기본값은 "보통 이하"라서 VR/게임에 CPU를 양보합니다. 12세대 이후 Intel CPU에서는 *E코어만 사용*, Windows 11에서는 *효율 모드*도 쓸 수 있습니다.
 
 언어는 설정 탭에서 바꿀 수 있습니다 (auto / en / ko).

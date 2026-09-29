@@ -18,7 +18,7 @@ from .datasets import frame_count
 from .engine import dataset_files
 from .frames import decode_camera
 from .i18n import Translator
-from .params import LIP_SHAPES
+from .params import all_target_names
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ class ClassDialog(tk.Toplevel):
 
         ttk.Label(frm, text=t("col_target")).grid(row=1, column=0, sticky="w")
         self.none_label = t("none")
-        shapes = [self.none_label] + sorted(LIP_SHAPES, key=LIP_SHAPES.get)
+        shapes = [self.none_label] + all_target_names()  # SRanipal names, then Unified-only (v6 module)
         self.target = tk.StringVar(value=cls.target or self.none_label)
         ttk.Combobox(frm, textvariable=self.target, values=shapes, state="readonly", width=28).grid(
             row=1, column=1, sticky="ew")
@@ -421,7 +421,74 @@ class App:
         line(t("language"), lambda: ttk.Combobox(tab, textvariable=self.lang_var, values=("auto", "en", "ko"),
                                                  state="readonly", width=8))
         ttk.Button(tab, text=t("save"), command=self.on_save_settings).grid(row=row, column=1, sticky="w", pady=12)
+        self._build_vrcft_box(tab).grid(row=row + 1, column=0, columnspan=2, sticky="we", pady=(4, 0))
         self._build_perf_box(tab).grid(row=0, column=2, rowspan=row + 1, sticky="nw", padx=(24, 0))
+
+    def _build_vrcft_box(self, parent):
+        t = self.t
+        box = ttk.LabelFrame(parent, text=t("vrcft_module"), padding=8)
+        self.wrap_var = tk.BooleanVar(value=self.cfg.vrcft_wrap_sranipal)
+        self.max_mode_var = tk.BooleanVar(value=self.cfg.vrcft_override_mode == "max")
+        self.vrcft_status = ttk.Label(box, text="", wraplength=520, justify="left")
+        self.vrcft_status.pack(anchor="w")
+        ttk.Checkbutton(box, text=t("wrap_sranipal"), variable=self.wrap_var).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(box, text=t("max_mode"), variable=self.max_mode_var,
+                        command=self.on_max_mode).pack(anchor="w")
+        btns = ttk.Frame(box)
+        btns.pack(anchor="w", pady=(6, 0))
+        ttk.Button(btns, text=t("install"), command=self.on_vrcft_install).pack(side="left")
+        ttk.Button(btns, text=t("uninstall"), command=self.on_vrcft_uninstall).pack(side="left", padx=6)
+        self._refresh_vrcft_status()
+        return box
+
+    def _refresh_vrcft_status(self):
+        from . import vrcft_install
+        t = self.t
+        try:
+            st = vrcft_install.status(self.cfg)
+        except Exception as e:
+            self.vrcft_status.configure(text=str(e))
+            return
+        if st["installed"]:
+            text = t("mod_installed") % (st["installed_version"] or "?")
+            if st["available_version"] and st["installed_version"] != st["available_version"]:
+                text += "  " + t("mod_update") % st["available_version"]
+        else:
+            text = t("mod_not_installed")
+        if st["sranipal"]:
+            s = st["sranipal"][0]
+            text += "\n" + (t("sran_wrapped") if s["disabled"] else t("sran_found")) % s["name"]
+        else:
+            text += "\n" + t("sran_missing")
+        if not st["vrcft_found"]:
+            text += "\n" + t("vrcft_missing") % st["custom_libs"]
+        self.vrcft_status.configure(text=text)
+
+    def on_max_mode(self):
+        self.cfg.vrcft_override_mode = "max" if self.max_mode_var.get() else "replace"
+        self.engine.vrcft.max_mode = self.cfg.vrcft_override_mode == "max"
+        self.engine.vrcft._table_sent = False  # resend the table with the new mode
+        self.engine.save_config()
+
+    def on_vrcft_install(self):
+        from . import vrcft_install
+        try:
+            self.cfg.vrcft_wrap_sranipal = bool(self.wrap_var.get())
+            self.engine.save_config()
+            steps = vrcft_install.install(self.cfg)
+            messagebox.showinfo(self.t("vrcft_module"), "\n".join(steps), parent=self.root)
+        except Exception as e:
+            self._error(e)
+        self._refresh_vrcft_status()
+
+    def on_vrcft_uninstall(self):
+        from . import vrcft_install
+        try:
+            steps = vrcft_install.uninstall(self.cfg)
+            messagebox.showinfo(self.t("vrcft_module"), "\n".join(steps), parent=self.root)
+        except Exception as e:
+            self._error(e)
+        self._refresh_vrcft_status()
 
     def _build_perf_box(self, parent):
         t = self.t
@@ -441,6 +508,24 @@ class App:
             ttk.Combobox(box, textvariable=var, state="readonly", width=30, values=list(labels.values())).grid(
                 row=row + 1, column=0, columnspan=2, sticky="w", pady=(0, 4))
             row += 2
+        from . import system
+        self.prio_labels = {p: t("prio_" + p) for p in ("above_normal", "normal", "below_normal", "idle")}
+        self.prio_var = tk.StringVar(value=self.prio_labels.get(c.process_priority, self.prio_labels["normal"]))
+        ttk.Label(box, text=t("priority")).grid(row=row, column=0, columnspan=2, sticky="w")
+        ttk.Combobox(box, textvariable=self.prio_var, state="readonly", width=30,
+                     values=list(self.prio_labels.values())).grid(row=row + 1, column=0, columnspan=2, sticky="w",
+                                                                  pady=(0, 2))
+        self.ecores_var = tk.BooleanVar(value=c.cpu_affinity == "ecores")
+        self.eco_var = tk.BooleanVar(value=c.efficiency_mode)
+        cb = ttk.Checkbutton(box, text=t("ecores"), variable=self.ecores_var)
+        cb.grid(row=row + 2, column=0, columnspan=2, sticky="w")
+        if not system.is_hybrid_cpu():
+            cb.state(["disabled"])
+        cb = ttk.Checkbutton(box, text=t("eco_mode"), variable=self.eco_var)
+        cb.grid(row=row + 3, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        if not system.IS_WINDOWS:
+            cb.state(["disabled"])
+        row += 4
         ttk.Label(box, text=t("infer_threads")).grid(row=row, column=0, sticky="w", pady=2)
         ttk.Spinbox(box, from_=1, to=max(1, os.cpu_count() or 1), textvariable=self.threads_var,
                     width=5).grid(row=row, column=1, sticky="w", padx=(6, 0))
@@ -551,7 +636,8 @@ class App:
         dot, lbl = self.status_labels["vrcft"]
         state = "ok" if v.get("connected") else "disconnected"
         dot.itemconfigure("dot", fill=STATE_COLORS[state])
-        lbl.configure(text="%s: %s" % (t("vrcft"), t(state)))
+        proto = {1: t("proto_old"), 2: t("proto_v6")}.get(v.get("protocol"), "")
+        lbl.configure(text="%s: %s%s" % (t("vrcft"), t(state), " (%s)" % proto if state == "ok" and proto else ""))
         model = "model ✓" if s["model_loaded"] else "model ✗"
         if s["model_dirty"]:
             model += "*"
@@ -830,8 +916,13 @@ class App:
 
     def on_apply_perf(self):
         try:
+            from . import system
             c = self.cfg
             c.infer_device, c.infer_threads, c.infer_int8, c.max_infer_rate = self._read_perf()
+            c.process_priority = next(p for p, text in self.prio_labels.items() if text == self.prio_var.get())
+            c.cpu_affinity = "ecores" if self.ecores_var.get() else "all"
+            c.efficiency_mode = bool(self.eco_var.get())
+            system.apply(c)
             self.engine.save_config()
             self.engine.restart_inference()
         except Exception as e:

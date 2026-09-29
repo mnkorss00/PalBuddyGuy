@@ -628,6 +628,39 @@ e.stop()
         self.assertTrue(any(r["backend"].startswith("ONNX") for r in out["r"]))
 
 
+class SystemTests(unittest.TestCase):
+    def test_parse_hybrid_core_info(self):
+        """Synthetic GetLogicalProcessorInformationEx buffer for a 12700K: 8 P-cores with 2
+        threads each (efficiency class 1) and 4 E-cores (class 0)."""
+        import struct
+        from palbuddy import system
+        buf = b""
+        for core in range(12):
+            p_core = core < 8
+            mask = (0b11 << (core * 2)) if p_core else (1 << (16 + core - 8))
+            rel = struct.pack("<BB20xH", 1 if p_core else 0, 1 if p_core else 0, 1)
+            rel += struct.pack("<QH6x", mask, 0)
+            buf += struct.pack("<II", 0, 8 + len(rel)) + rel
+        cores = system.parse_core_info(buf, len(buf))
+        self.assertEqual(len(cores), 12)
+        self.assertEqual(sum(1 for c, _ in cores if c == 0), 4)
+        orig = system.core_efficiency_classes
+        system.core_efficiency_classes = lambda: cores
+        try:
+            self.assertEqual(system.efficiency_core_mask(), 0xF0000)
+            self.assertTrue(system.is_hybrid_cpu())
+            system.core_efficiency_classes = lambda: [(0, 1), (0, 2)]  # not hybrid
+            self.assertEqual(system.efficiency_core_mask(), 0)
+        finally:
+            system.core_efficiency_classes = orig
+
+    def test_priority_validation(self):
+        from palbuddy import system
+        with self.assertRaises(ValueError):
+            system.set_priority("turbo")
+        self.assertEqual(Config().process_priority, "below_normal")
+
+
 class ConfigTests(unittest.TestCase):
     def test_roundtrip(self):
         cfg = default_config()
@@ -637,7 +670,14 @@ class ConfigTests(unittest.TestCase):
             cfg2 = Config.load(p)
         self.assertEqual(cfg2.to_dict(), cfg.to_dict())
         # same mapping as the original to_replace table
-        self.assertEqual({i: s for i, s, _ in cfg.targets()}, {2: 0, 1: 1, 4: 20, 5: 19, 7: 2, 3: 11})
+        self.assertEqual({i: t for i, t, _ in cfg.targets()},
+                         {2: "JawRight", 1: "JawLeft", 4: "MouthUpperUpLeft", 5: "MouthUpperUpRight",
+                          7: "JawForward", 3: "MouthPout"})
+        cfg.classes[1].target = "BrowLowererLeft"  # Unified Expression names are valid too
+        self.assertEqual(cfg.validate(), [])
+        cfg.classes[1].target = "NotAShape"
+        self.assertEqual(len(cfg.validate()), 1)
+        cfg.classes[1].target = "JawLeft"
         self.assertEqual(cfg.validate(), [])
 
 

@@ -18,7 +18,7 @@ from . import onnx_runtime
 from .config import Config
 from .datasets import Recorder, convert_legacy_pickles
 from .frames import FrameHub, ProxyClient, RateMeter, SRanipalReceiver
-from .vrcft import VRCFTServer, encode_params
+from .vrcft import VRCFTServer
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +65,9 @@ class Engine:
             self.source = SRanipalReceiver(self.hub, cfg.bind_host, cfg.face_port, cfg.eye_port,
                                            swapped=cfg.swapped, mode=cfg.input_mode,
                                            stall_timeout=cfg.stall_timeout).start()
-        self.vrcft = VRCFTServer(cfg.bind_host, cfg.vrcft_port).start()
+        self.vrcft = VRCFTServer(cfg.bind_host, cfg.vrcft_port)
+        self.vrcft.max_mode = cfg.vrcft_override_mode == "max"
+        self.vrcft.start()
         return self
 
     @property
@@ -471,20 +473,22 @@ class Engine:
 
             alpha = self.cfg.smoothing
             out, pairs = {}, []
-            for idx, shape, max_power in self.cfg.targets():
+            for idx, target, max_power in self.cfg.targets():
                 v = normalize(raw[idx], max_power)
                 if 0.0 < alpha < 1.0:
                     prev = self._smoothed.get(idx, v)
                     v = prev * alpha + v * (1.0 - alpha)
                     self._smoothed[idx] = v
                 out[idx] = v
-                pairs.append((shape, v))
+                pairs.append((target, v))
             self.last_out = out
             now = time.monotonic()
             if pairs and now - last_send >= min_interval:
-                self.vrcft.send_params(pairs)
+                self.vrcft.send_targets(pairs)
                 last_send = now
         runtime.release()
+        if self.vrcft is not None:
+            self.vrcft.clear()  # v6 module: fall back to plain SRanipal right away
         self.infer_backend = None
         log.info("Inference stopped")
 
@@ -505,15 +509,15 @@ class Engine:
             self.fastcal_state = "Starting in %d s - follow the avatar" % t
             if self._infer_stop.wait(1):
                 return
-        self.vrcft.send_params([(shape, -1.0) for _, shape, _ in targets])
+        self.vrcft.send_targets([(target, -1.0) for _, target, _ in targets])
 
         results = {}
-        for n, (idx, shape, _) in enumerate(targets):
+        for n, (idx, target, _) in enumerate(targets):
             name = self.cfg.classes[idx].name
             self.fastcal_state = "Calibrating %s (%d/%d)" % (name, n + 1, len(targets))
             log.info(self.fastcal_state)
             for i in range(101):  # ease in over 1s
-                self.vrcft.send_packet(encode_params([(shape, i / 50 - 1)]))
+                self.vrcft.send_targets([(target, i / 50 - 1)])
                 if self._infer_stop.wait(0.01):
                     return
             if self._infer_stop.wait(2):
@@ -528,7 +532,7 @@ class Engine:
                     count += 1
             results[idx] = (total / count if count else 0.0) + 1e-9
             for i in range(101):  # ease out
-                self.vrcft.send_packet(encode_params([(shape, 1 - i / 50)]))
+                self.vrcft.send_targets([(target, 1 - i / 50)])
                 if self._infer_stop.wait(0.01):
                     return
 
