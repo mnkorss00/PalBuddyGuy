@@ -112,6 +112,10 @@ For **VRCFaceTracking v6**, install the module from the app with **Install / upd
 
 * VRCFaceTracking v6 lets only one module provide eye tracking and one provide expressions, so the Pal Buddy Guy module **runs the SRanipal module inside itself**. The installer disables the standalone SRanipal module by renaming its `module.json`, and **Remove** restores it. Install the SRanipal module in VRCFaceTracking first.
 * A class's *Drives shape* can be an SRanipal lip shape (as before) or any **Unified Expression**, including eye-area shapes like `BrowLowererLeft` or `EyeSquintRight` that SRanipal can't express. For example, you can train a frown seen by the Pro Eye cameras.
+* **v1 (legacy SRanipal) avatar parameters work.** VRCFaceTracking v6 computes the v1 parameters (`JawOpen`, `MouthSmileLeft`, `SmileSadLeft`, `JawX`, …) from Unified Expressions. SRanipal targets are translated so that this round trip gives the v1 parameter **exactly** the trained value, which is verified against VRCFaceTracking's own parameter functions for every shape. The v1 eye/brow parameters can also be chosen as targets directly: `LeftEyeWiden`, `LeftEyeSqueeze`, `BrowDownLeft`, `BrowsInnerUp`, and so on. Limitations that come from VRCFaceTracking itself:
+  * The v1 `Tongue*Morph` parameters are always 0 in v6. Pal Buddy Guy drives the two tongue directions instead.
+  * `MouthUpperOverturn` / `MouthLowerOverturn` also raise v1 `MouthUpperUp*` / `MouthLowerDown*`. This follows VRCFaceTracking's conversion formula, and every Unified-based module behaves the same way.
+  * `MouthSadLeft/Right` are sent as `MouthStretch*`, because that reproduces v1 exactly without leaking into the other side. For a Unified (v2) avatar, pick `MouthFrownLeft/Right` instead.
 * By default Pal Buddy Guy's value replaces SRanipal's for the shapes it drives. *Keep SRanipal's value when it is larger* switches to the maximum of the two.
 * When tracking stops, the module falls back to plain SRanipal within 0.5 s.
 * The original VRCFaceTracking module (≤ v4) still works; it only understands SRanipal lip shapes.

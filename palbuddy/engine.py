@@ -338,6 +338,11 @@ class Engine:
         if self.busy == "training":
             raise RuntimeError("Wait for training to finish")
         runtime = self._make_runtime()  # errors surface here, in the caller
+        from .params import V1_UNSUPPORTED
+        for _, target, _ in self.cfg.targets():
+            if target in V1_UNSUPPORTED:
+                log.warning("%s: VRCFaceTracking v6 always sends 0 for this v1 parameter; the tongue "
+                            "directions are driven instead", target)
         self._infer_stop.clear()
         self._smoothed = {}
         self._infer_thread = threading.Thread(target=self._infer_loop, args=(runtime,), daemon=True,

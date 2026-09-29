@@ -39,8 +39,11 @@ V=/path/to/VRCFaceTracking   # source checkout
 dotnet build $V/VRCFaceTracking.ModuleProcess -c Release -o e2e/mp
 dotnet build tests/Harness      -c Release -p:VRCFTSource=$V -o e2e/harness
 dotnet build tests/FakeSRanipal -c Release -p:VRCFTSource=$V -o e2e/fake
+dotnet build tests/V1Check      -c Release -p:VRCFTSource=$V -o e2e/v1check
 PALBUDDY_VRCFT_TEST_DIR=$PWD/e2e python -m unittest tests.test_vrcft_module   # from the repo root
 ```
 The test installs `prebuilt/` into a temporary CustomLibs folder and drives shapes from the Python app. It checks that the overrides arrive with no flicker back to SRanipal's value, that eye data and untouched shapes pass through, and that the module falls back to SRanipal when the app stops sending.
+
+`tests/V1Check` evaluates VRCFaceTracking's own v1 (legacy SRanipal) parameter functions. The test uses it to check that every SRanipal and v1 target produces the trained value as a v1 avatar parameter, including combined ones like `JawX` and `SmileSadLeft`.
 
 Not covered: the real SRanipal module and hardware. The wrapping relies on the SRanipal module behaving like a normal VRCFaceTracking module (only `ExtTrackingModule` and `UnifiedTracking.Data`). Its camera images aren't forwarded to VRCFaceTracking's UI.

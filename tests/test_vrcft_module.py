@@ -8,6 +8,7 @@ real VRCFaceTracking module process -> sandbox IPC -> a host emulator - and need
   mp/VRCFaceTracking.ModuleProcess.dll   (VRCFaceTracking.ModuleProcess build)
   harness/Harness.dll                    (vrcft-module/tests/Harness build)
   fake/FakeSRanipal.dll                  (vrcft-module/tests/FakeSRanipal build)
+  v1check/V1Check.dll                    (vrcft-module/tests/V1Check build)
 See vrcft-module/README.md for the build commands.
 """
 
@@ -26,7 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from palbuddy import vrcft_install  # noqa: E402
 from palbuddy.config import Config, ExpressionClass  # noqa: E402
 from palbuddy.net import recv_exact  # noqa: E402
-from palbuddy.params import UNIFIED_EXPRESSIONS  # noqa: E402
+from palbuddy.params import (LIP_SHAPES, UNIFIED_EXPRESSIONS, V1_ONLY, V1_UNSUPPORTED,  # noqa: E402
+                             unified_weights)
 from palbuddy.vrcft import VRCFTServer  # noqa: E402
 
 
@@ -131,6 +133,19 @@ class ProtocolTwoTests(unittest.TestCase):
         del torch
 
 
+class MappingTests(unittest.TestCase):
+    def test_transforms(self):
+        self.assertEqual(unified_weights("TongueLongStep1", 1.0), [("TongueOut", 0.5)])
+        self.assertEqual(unified_weights("TongueLongStep2", 0.5), [("TongueOut", 0.75)])
+        self.assertEqual(unified_weights("TongueLongStep2", 0.0), [("TongueOut", 0.0)])  # inactive = no push
+        self.assertEqual(unified_weights("BrowDownLeft", 0.4), [("BrowPinchLeft", 0.4), ("BrowLowererLeft", 0.4)])
+        self.assertEqual(unified_weights("MouthSadLeft", 0.3), [("MouthStretchLeft", 0.3)])
+        self.assertEqual(unified_weights("JawOpen", 2.0), [("JawOpen", 1.0)])  # clamped
+        for name in list(LIP_SHAPES) + list(V1_ONLY):
+            for u, _ in unified_weights(name, 0.5):
+                self.assertIn(u, UNIFIED_EXPRESSIONS)
+
+
 class InstallerTests(unittest.TestCase):
     def test_install_uninstall(self):
         tmp = tempfile.TemporaryDirectory()
@@ -163,6 +178,50 @@ class InstallerTests(unittest.TestCase):
 
 
 TEST_DIR = os.environ.get("PALBUDDY_VRCFT_TEST_DIR")
+
+
+@unittest.skipUnless(TEST_DIR and os.path.isdir(os.path.join(TEST_DIR, "v1check")),
+                     "set PALBUDDY_VRCFT_TEST_DIR to run (needs .NET builds)")
+class V1RoundTripTests(unittest.TestCase):
+    """For avatars using VRCFaceTracking's v1 (SRanipal) parameters: the Unified weights we
+    send must make VRCFT v6 compute the v1 parameter equal to the trained value. Checked with
+    VRCFT's own parameter functions (vrcft-module/tests/V1Check)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cases = []
+        for name in list(LIP_SHAPES) + list(V1_ONLY):
+            for w in (0.2, 0.55, 1.0):
+                cases.append({"id": "%s|%s" % (name, w), "shapes": dict(unified_weights(name, w))})
+        out = subprocess.run(["dotnet", os.path.join(TEST_DIR, "v1check", "V1Check.dll")],
+                             input="\n".join(json.dumps(c) for c in cases), capture_output=True, text=True,
+                             timeout=120)
+        cls.results = {}
+        for line in out.stdout.splitlines():
+            d = json.loads(line)
+            name, w = d["id"].split("|")
+            cls.results[(name, float(w))] = d["v1"]
+
+    def test_every_target_reproduces_its_v1_parameter(self):
+        wrong = []
+        for (name, w), v1 in self.results.items():
+            if name in V1_UNSUPPORTED:
+                self.assertEqual(v1[name], 0.0)  # VRCFT v6 always sends 0 for these
+                continue
+            if abs(v1[name] - w) > 0.005:
+                wrong.append((name, w, round(v1[name], 4)))
+        self.assertEqual(wrong, [])
+
+    def test_combined_v1_parameters(self):
+        r = self.results
+        self.assertAlmostEqual(r[("JawRight", 0.55)]["JawX"], 0.55, places=3)
+        self.assertAlmostEqual(r[("JawLeft", 0.55)]["JawX"], -0.55, places=3)
+        self.assertAlmostEqual(r[("MouthSmileLeft", 0.55)]["SmileSadLeft"], 0.55, places=3)
+        self.assertAlmostEqual(r[("MouthSadLeft", 0.55)]["SmileSadLeft"], -0.55, places=3)
+        self.assertAlmostEqual(r[("MouthSadLeft", 0.55)]["MouthSadRight"], 0.0, places=3)  # no leak
+        self.assertAlmostEqual(r[("TongueUp", 0.55)]["TongueY"], 0.55, places=3)
+        self.assertAlmostEqual(r[("CheekPuffLeft", 0.55)]["PuffSuckLeft"], 0.55, places=3)
+        self.assertAlmostEqual(r[("TongueLongStep1", 0.55)]["TongueLongStep2"], 0.0, places=3)
 
 
 @unittest.skipUnless(TEST_DIR and os.path.isdir(TEST_DIR), "set PALBUDDY_VRCFT_TEST_DIR to run (needs .NET builds)")

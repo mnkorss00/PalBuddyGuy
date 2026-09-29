@@ -23,7 +23,7 @@ from .net import Disconnected, close_quietly, make_listener, recv_exact, tune_st
 
 log = logging.getLogger(__name__)
 
-from .params import legacy_index, unified_targets
+from .params import legacy_index, unified_targets, unified_weights
 
 MSG_PARAMS = 2
 MSG_TABLE = 5
@@ -222,16 +222,16 @@ class VRCFTServer:
         return self.send_packet(encode_params(pairs))
 
     def _build_table(self, names):
-        table, slots = [], {}
+        table = []
         for name in names:
-            slots[name] = []
             for unified in unified_targets(name):
                 if unified not in table:
                     table.append(unified)
-                slots[name].append(table.index(unified))
         if len(table) > 255:
             raise ValueError("too many targets")
-        self._table, self._slots = tuple(table), slots
+        self._table = tuple(table)
+        self._slots = {u: i for i, u in enumerate(table)}  # unified name -> slot
+        self._known = set(names)
         self._table_sent = False
 
     def send_targets(self, pairs):
@@ -253,12 +253,13 @@ class VRCFTServer:
                 legacy.append((idx, v))
             return self.send_packet(encode_params(legacy)) if legacy else False
         names = tuple(name for name, _ in pairs)
-        if self._table is None or any(n not in self._slots for n in names):
+        if self._table is None or any(n not in self._known for n in names):
             self._build_table(names)
         packet = b""
         if not self._table_sent:
             packet += encode_table(self._table, self.max_mode)
-        slot_weights = [(slot, (float(v) + 1.0) / 2.0) for name, v in pairs for slot in self._slots[name]]
+        slot_weights = [(self._slots[u], uw) for name, v in pairs
+                        for u, uw in unified_weights(name, (float(v) + 1.0) / 2.0)]
         packet += encode_weights(slot_weights)
         ok = self.send_packet(packet)
         if ok:
