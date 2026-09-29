@@ -20,7 +20,7 @@ import time
 import numpy as np
 import torch
 
-from .config import channels_for
+from .config import LOSSES, channels_for
 from .datasets import open_recording
 from .model import BuddyNet, pick_device
 
@@ -98,25 +98,73 @@ def split_recordings(recordings, fraction, channels):
     return train, np.concatenate(xs), np.concatenate(ys)
 
 
+HIT_THRESHOLD = 0.5  # the shown expression's output counts as recognised above this
+FALSE_THRESHOLD = 0.3  # another class's output counts as a false activation above this
+
+
 @torch.no_grad()
 def evaluate(model, val_x, val_y, num_classes, device, batch=256):
-    """-> (mse loss, accuracy, per-class accuracy list) on the held-out frames."""
+    """Metrics on the held-out frames (outputs compared with one-hot targets):
+      loss        MSE (same scale for every model, so runs are comparable)
+      acc         the shown expression has the highest output
+      hit         the shown expression's output is above HIT_THRESHOLD
+      false       some *other* class's output is above FALSE_THRESHOLD (a wrong shape moves)
+      per_class   acc per class
+      score       one number to rank models, see score()
+    """
     was_training = model.training
     model.eval()
     eye = torch.eye(num_classes, device=device)
-    loss_sum, correct = 0.0, np.zeros(num_classes)
+    loss_sum = 0.0
+    correct, hits, falses = np.zeros(num_classes), np.zeros(num_classes), np.zeros(num_classes)
     counts = np.bincount(val_y, minlength=num_classes).astype(float)
     for i in range(0, len(val_x), batch):
         x = torch.from_numpy(val_x[i:i + batch]).to(device)
         y = torch.from_numpy(val_y[i:i + batch]).to(device)
         pred = model(x).float()
-        loss_sum += float(((pred - eye[y]) ** 2).mean(dim=1).sum())
-        hit = (pred.argmax(dim=1) == y).cpu().numpy()
-        np.add.at(correct, val_y[i:i + batch], hit)
+        target = eye[y]
+        loss_sum += float(((pred - target) ** 2).mean(dim=1).sum())
+        ys = val_y[i:i + batch]
+        np.add.at(correct, ys, (pred.argmax(dim=1) == y).cpu().numpy())
+        own = pred.gather(1, y[:, None])[:, 0]
+        np.add.at(hits, ys, (own > HIT_THRESHOLD).cpu().numpy())
+        others = pred.masked_fill(target.bool(), 0.0).max(dim=1).values
+        np.add.at(falses, ys, (others > FALSE_THRESHOLD).cpu().numpy())
     if was_training:
         model.train()
-    per_class = [float(c / n) if n else float("nan") for c, n in zip(correct, counts)]
-    return loss_sum / len(val_x), float(correct.sum() / counts.sum()), per_class
+    total = counts.sum()
+    m = {"loss": loss_sum / len(val_x), "acc": float(correct.sum() / total), "hit": float(hits.sum() / total),
+         "false": float(falses.sum() / total),
+         "per_class": [float(c / n) if n else float("nan") for c, n in zip(correct, counts)]}
+    m["score"] = score(m)
+    return m
+
+
+def score(m):
+    """0..100. False activations weigh double: a wrong shape moving is more visible
+    on the avatar than a correct one moving a bit less."""
+    return 100.0 * (m["acc"] + m["hit"] + 2.0 * (1.0 - m["false"])) / 4.0
+
+
+NORM_FRAMES = 4096
+
+
+def input_statistics(recordings, channels, seed=0):
+    """Per-channel mean and std of the training frames (for the compact model)."""
+    rng = np.random.default_rng(seed)
+    recs = [rec for recs in recordings for rec in recs]
+    per = max(1, NORM_FRAMES // len(recs))
+    parts = []
+    for rec in recs:
+        idx = np.sort(rng.choice(len(rec), size=min(per, len(rec)), replace=False))
+        parts.append(np.asarray(rec[idx, channels], dtype=np.float32))
+    x = np.concatenate(parts)
+    mean = x.mean(axis=(0, 2, 3), dtype=np.float64)
+    std = x.std(axis=(0, 2, 3), dtype=np.float64)
+    # channels that barely move in the training data mustn't turn tiny runtime
+    # differences into huge inputs
+    floor = max(1e-6, 0.05 * float(np.median(std)))
+    return mean.astype(np.float32), np.maximum(std, floor).astype(np.float32)
 
 
 def load_recordings(cfg, log_fn=print):
@@ -141,18 +189,52 @@ def load_recordings(cfg, log_fn=print):
     return recordings, total
 
 
-def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None, device=None):
-    """Train a model on the configured classes and return it (on `device`)."""
+OUTPUT_FOR_LOSS = {"mse": "relu", "bce": "sigmoid"}
+# the compact net (fewer weights, standardised input) needs a larger step to train in the same epochs
+ARCH_LR_SCALE = {"compact": 10.0}
+
+
+class Data:
+    """Recordings split into training frames and held-out validation frames."""
+
+    def __init__(self, cfg, log_fn=print):
+        recordings, self.total_frames = load_recordings(cfg, log_fn)
+        self.channels = channels_for(cfg.input_mode)
+        self.recordings, self.val_x, self.val_y = split_recordings(recordings, cfg.validation_split, self.channels)
+        if self.val_x is not None:
+            log_fn("Holding out %d frames (end of each recording) for validation" % len(self.val_x))
+        self._stats = None
+
+    def statistics(self):
+        if self._stats is None:
+            self._stats = input_statistics(self.recordings, self.channels)
+        return self._stats
+
+
+def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None, device=None,
+          data=None, arch=None, loss=None, seed=None):
+    """Train a model on the configured classes and return it (on `device`).
+    arch / loss default to cfg.model_arch / cfg.loss; data (a Data) can be shared
+    between runs so they see the same frames."""
     device = device or pick_device()
     stop_event = stop_event or threading.Event()
     on_progress = on_progress or (lambda **kw: None)
+    arch = arch or cfg.model_arch
+    loss_name = loss or cfg.loss
+    if loss_name not in LOSSES:
+        raise ValueError("loss must be one of %s" % ", ".join(LOSSES))
 
-    recordings, total_frames = load_recordings(cfg, log_fn)
-    channels = channels_for(cfg.input_mode)
-    recordings, val_x, val_y = split_recordings(recordings, cfg.validation_split, channels)
-    if val_x is not None:
-        log_fn("Holding out %d frames (end of each recording) for validation" % len(val_x))
-    model = init_model if init_model is not None else BuddyNet(cfg.num_classes, cfg.input_mode, cfg.model_arch)
+    data = data or Data(cfg, log_fn)
+    recordings, val_x, val_y, channels = data.recordings, data.val_x, data.val_y, data.channels
+    if init_model is not None:
+        model = init_model
+        if model.output != OUTPUT_FOR_LOSS[loss_name]:
+            raise ValueError("The current model has %s outputs; it can't continue training with %s loss"
+                             % (model.output, loss_name.upper()))
+    else:
+        model = BuddyNet(cfg.num_classes, cfg.input_mode, arch, OUTPUT_FOR_LOSS[loss_name])
+        if model.normalized:
+            model.set_normalization(*data.statistics())
     if model.num_outputs != cfg.num_classes:
         raise ValueError("Model output count does not match the class list")
     if model.input_mode != cfg.input_mode:
@@ -160,19 +242,23 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
     model.to(device).train()
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+    log_fn("Training a %s model with %s loss" % (model.arch, loss_name.upper()))
 
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate * ARCH_LR_SCALE.get(model.arch, 1.0))
     use_amp = cfg.mixed_precision and device.type == "cuda"
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     else:  # torch < 2.3
         scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     mse = torch.nn.MSELoss()
+    bce = torch.nn.BCEWithLogitsLoss()
 
     # one "epoch" = as many samples as the original: 2048 frames per class
     steps = max(1, (2048 * cfg.num_classes) // cfg.batch_size)
     # one sampler (and RNG) per loader thread: numpy Generators aren't thread safe
-    seeds = np.random.SeedSequence().spawn(2)
+    seeds = np.random.SeedSequence(seed).spawn(2)
+    if seed is not None:
+        torch.manual_seed(seed)
     q = queue.Queue(maxsize=6)
     producer_stop = threading.Event()
 
@@ -203,6 +289,7 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
         w.start()
 
     history = []
+    best = None  # (score, epoch, weights): the epoch that did best on the held-out frames is kept
     start = time.monotonic()
     try:
         for epoch in range(cfg.epochs):
@@ -217,8 +304,11 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
                 y = item[1].to(device, non_blocking=True)
                 opt.zero_grad(set_to_none=True)
                 with (torch.autocast(device_type="cuda") if use_amp else contextlib.nullcontext()):
-                    pred = model(x)
-                loss = mse(pred.float(), y) * 100  # same scale as the original
+                    pred = model(x, logits=True)
+                if loss_name == "bce":
+                    loss = bce(pred.float(), y) * 100
+                else:
+                    loss = mse(pred.float(), y) * 100  # same scale as the original
                 scaler.scale(loss).backward()
                 scaler.step(opt)
                 scaler.update()
@@ -231,11 +321,16 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
             history.append(avg)
             val = {}
             if val_x is not None:
-                vloss, vacc, per_class = evaluate(model, val_x, val_y, cfg.num_classes, device)
-                val = {"val_loss": vloss, "val_acc": vacc}
-                model.val_metrics = dict(val, per_class=dict(zip((c.name for c in cfg.classes), per_class)))
-                log_fn("Epoch %d/%d  avg loss %.6f  val loss %.6f  val accuracy %.1f%%" % (
-                    epoch + 1, cfg.epochs, avg, vloss, vacc * 100))
+                m = evaluate(model, val_x, val_y, cfg.num_classes, device)
+                val = {"val_loss": m["loss"], "val_acc": m["acc"], "val_hit": m["hit"], "val_false": m["false"],
+                       "val_score": m["score"]}
+                if best is None or m["score"] > best[0]:
+                    names = [c.name for c in cfg.classes]
+                    metrics = dict(val, per_class=dict(zip(names, m["per_class"])), epoch=epoch + 1)
+                    best = (m["score"], metrics, {k: v.detach().clone() for k, v in model.state_dict().items()})
+                log_fn("Epoch %d/%d  avg loss %.6f  val: accuracy %.1f%%  recognised %.1f%%  false %.1f%%  "
+                       "score %.1f" % (epoch + 1, cfg.epochs, avg, m["acc"] * 100, m["hit"] * 100,
+                                       m["false"] * 100, m["score"]))
             else:
                 log_fn("Epoch %d/%d  avg loss %.6f" % (epoch + 1, cfg.epochs, avg))
             on_progress(epoch=epoch + 1, epochs=cfg.epochs, step=steps, steps=steps, loss=avg, avg=avg,
@@ -245,11 +340,51 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
         for w in workers:
             w.join(timeout=5)
     model.eval()
-    metrics = getattr(model, "val_metrics", None)
-    if metrics:
+    if best is not None:
+        _, metrics, weights = best
+        if metrics["epoch"] != len(history):
+            model.load_state_dict(weights)
+            log_fn("Keeping the weights of epoch %d, which did best on the held-out frames" % metrics["epoch"])
+        model.val_metrics = metrics
         worst = sorted(metrics["per_class"].items(), key=lambda kv: kv[1])[:3]
         log_fn("Validation accuracy per class (worst first): %s" % ", ".join(
             "%s %.0f%%" % (name, acc * 100) for name, acc in worst))
-    if history and history[-1] > 0.001:
+    if loss_name == "mse" and history and history[-1] > 0.001:
         log_fn("Warning: final loss %.6f is above 0.001 - check your recordings / class list" % history[-1])
     return model, history
+
+
+# candidates the comparison trains by default: (arch, loss)
+DEFAULT_CANDIDATES = (("standard", "mse"), ("lite", "mse"), ("standard", "bce"), ("compact", "bce"),
+                      ("compact", "mse"))
+
+
+def compare(cfg, candidates=DEFAULT_CANDIDATES, on_progress=None, stop_event=None, log_fn=print, device=None,
+            seed=1234):
+    """Train every (arch, loss) candidate on the same frames with the same sampling
+    seed and return [{"arch", "loss", "model", "metrics", "history"}] in candidate order."""
+    if cfg.validation_split <= 0:
+        raise ValueError("Comparing models needs held-out frames: set the validation split above 0")
+    on_progress = on_progress or (lambda **kw: None)
+    data = Data(cfg, log_fn)
+    if data.val_x is None:
+        raise ValueError("The recordings are too short to hold out frames for comparing models")
+    results = []
+    for i, (arch, loss_name) in enumerate(candidates):
+        log_fn("Comparing %d/%d: %s + %s" % (i + 1, len(candidates), arch, loss_name.upper()))
+        progress = (lambda k: lambda **info: on_progress(candidate=k, candidates=len(candidates), **info))(i)
+        model, history = train(cfg, on_progress=progress, stop_event=stop_event, log_fn=log_fn, device=device,
+                               data=data, arch=arch, loss=loss_name, seed=seed)
+        results.append({"arch": arch, "loss": loss_name, "model": model.cpu(), "history": history,
+                        "metrics": model.val_metrics})
+    return results
+
+
+def recommend(results, speed_key="ms", tolerance=0.5):
+    """Index of the best result: highest score; within `tolerance` points of it, the
+    fastest (then the smallest) wins, since those models track just as well for less."""
+    if not results:
+        return None
+    top = max(r["metrics"]["val_score"] for r in results)
+    close = [i for i, r in enumerate(results) if r["metrics"]["val_score"] >= top - tolerance]
+    return min(close, key=lambda i: (results[i].get(speed_key) or float("inf"), results[i].get("params") or 0))

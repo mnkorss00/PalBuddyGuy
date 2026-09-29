@@ -8,7 +8,7 @@ import threading
 import time
 
 from . import __version__
-from .config import DEFAULT_CONFIG_PATH, Config
+from .config import DEFAULT_CONFIG_PATH, LOSSES, MODEL_ARCHS, Config
 
 log = logging.getLogger("palbuddy")
 
@@ -22,7 +22,9 @@ HELP = """commands:
   infer              start sending tracking to VRCFT (enter 'stop' to end)
   fastcal            calibrate max power by puppeting the avatar
   stop               stop inference / training / recording
-  arch [standard|lite]  model size used for the next training
+  arch [standard|lite|compact]  model used for the next training
+  loss [mse|bce]        training method for the next training
+  compare               train every model candidate, show scores, apply the recommended one
   vrcft [status|install|uninstall]  VRCFaceTracking v6 module
   merged                             list merged parameters (sent to VRChat over OSC)
   merged add NAME TERMS [MIN NEUTRAL MAX [FORMAT BITS]]
@@ -52,6 +54,11 @@ def run_cli(engine):
         print("\repoch %d/%d step %d/%d  loss %.6f  avg %.6f     " % (
             min(i["epoch"] + 1, i["epochs"]), i["epochs"], i["step"], i["steps"], i["loss"], i["avg"]),
             end="", flush=True)
+
+    def compare_progress(**i):
+        print("\rmodel %d/%d  epoch %d/%d step %d/%d     " % (
+            i["candidate"] + 1, i["candidates"], min(i["epoch"] + 1, i["epochs"]), i["epochs"], i["step"],
+            i["steps"]), end="", flush=True)
 
     done_event = threading.Event()
 
@@ -197,11 +204,39 @@ def run_cli(engine):
                                      else " %d bit" % cls.osc_bits) or "-"))
             elif cmd == "arch":
                 if arg:
-                    if arg not in ("standard", "lite"):
-                        raise ValueError("arch must be standard or lite")
+                    if arg not in MODEL_ARCHS:
+                        raise ValueError("arch must be one of %s" % ", ".join(MODEL_ARCHS))
                     engine.cfg.model_arch = arg
                     engine.save_config()
                 print("model arch for training = %s" % engine.cfg.model_arch)
+            elif cmd == "loss":
+                if arg:
+                    if arg not in LOSSES:
+                        raise ValueError("loss must be one of %s" % ", ".join(LOSSES))
+                    engine.cfg.loss = arg
+                    engine.save_config()
+                print("training loss = %s" % engine.cfg.loss)
+            elif cmd == "compare":
+                done_event.clear()
+                outcome = {}
+                engine.compare_async(on_progress=compare_progress,
+                                     on_done=lambda ok, m, r, b: (outcome.update(ok=ok, m=m, r=r, b=b),
+                                                                  done_event.set()))
+                done_event.wait()
+                print("\n" + outcome["m"])
+                if outcome["ok"]:
+                    for i, r in enumerate(outcome["r"]):
+                        m = r["metrics"]
+                        print("%s %d) %-8s %-3s score %5.1f  accuracy %5.1f%%  recognised %5.1f%%  false %5.1f%%  "
+                              "%.2f ms  %.1f MB" % ("*" if i == outcome["b"] else " ", i + 1, r["arch"],
+                                                    r["loss"].upper(), m["val_score"], m["val_acc"] * 100,
+                                                    m["val_hit"] * 100, m["val_false"] * 100, r["ms"], r["size_mb"]))
+                    pick = input("apply which? [%d, Enter = recommended, n = none]: " % (outcome["b"] + 1)).strip()
+                    if pick.lower() != "n":
+                        r = outcome["r"][int(pick) - 1 if pick else outcome["b"]]
+                        engine.apply_candidate(r)
+                        print("now using %s + %s (saved to %s)" % (r["arch"], r["loss"], engine.cfg.model_path))
+                    engine.compare_results = None
             elif cmd == "bench":
                 done_event.clear()
                 engine.run_benchmark(on_done=lambda r, err: (print(err) if err else None, done_event.set()))

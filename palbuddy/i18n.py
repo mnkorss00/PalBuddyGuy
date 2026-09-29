@@ -171,9 +171,50 @@ STRINGS = {
     "amp": ("Mixed precision (faster on NVIDIA)", "혼합 정밀도 (NVIDIA에서 더 빠름)"),
     "cache": ("Cache recordings in RAM", "녹화 파일을 RAM에 캐시"),
     "resume": ("Continue from current model", "현재 모델에서 이어서 학습"),
-    "arch": ("Model", "모델 크기"),
+    "arch": ("Model", "모델 구조"),
     "arch_standard": ("standard (original)", "표준 (원본)"),
     "arch_lite": ("lite (~5x faster)", "경량 (약 5배 빠름)"),
+    "arch_compact": ("compact (~10x faster, small data)", "컴팩트 (약 10배 빠름, 적은 데이터용)"),
+    "loss_fn": ("Training method", "학습 방식"),
+    "loss_mse": ("MSE (original)", "MSE (원본)"),
+    "loss_bce": ("BCE (independent expressions)", "BCE (표정별 독립 학습)"),
+    "compare": ("Compare models & pick…", "모델 비교 후 선택…"),
+    "compare_title": ("Compare models", "모델 비교"),
+    "compare_help": ("Trains each selected model on the same recordings, measures it on the held-out end of every "
+                     "recording and times it on this PC. The recommended one is marked ★; select any row and "
+                     "press Apply to track with it right away (it is saved to the model file, the previous file "
+                     "is kept as .prev.pt).",
+                     "선택한 모델들을 같은 녹화로 각각 학습한 뒤, 각 녹화의 끝부분(학습에 안 쓴 구간)으로 채점하고 "
+                     "이 PC에서 속도를 잽니다. 추천 모델에는 ★가 붙습니다. 원하는 줄을 고르고 적용을 누르면 바로 "
+                     "그 모델로 트래킹합니다 (모델 파일에 저장되고, 이전 파일은 .prev.pt로 남습니다)."),
+    "compare_pick": ("Models to compare", "비교할 모델"),
+    "compare_epochs": ("Each model trains for %d epochs (Train tab setting).",
+                       "각 모델은 %d 에폭씩 학습합니다 (학습 탭 설정)."),
+    "compare_start": ("Start comparison", "비교 시작"),
+    "compare_running": ("Comparing…", "비교 중…"),
+    "compare_progress": ("Model %d/%d · epoch %d/%d", "모델 %d/%d · 에폭 %d/%d"),
+    "compare_results": ("Results", "결과"),
+    "cmp_loss": ("Method", "학습 방식"),
+    "cmp_score": ("Score", "점수"),
+    "cmp_acc": ("Accuracy", "정확도"),
+    "cmp_hit": ("Recognised", "인식률"),
+    "cmp_false": ("False act.", "오작동률"),
+    "cmp_ms": ("ms/frame", "ms/프레임"),
+    "cmp_size": ("MB", "MB"),
+    "compare_legend": ("Accuracy: the shown expression has the highest output. Recognised: its output is above 0.5. "
+                       "False act.: another expression's output is above 0.3 (a wrong shape moves) - lower is "
+                       "better. Score = (accuracy + recognised + 2 × (100% - false act.)) / 4. Models within "
+                       "0.5 points of the best count as equal and the fastest of them is recommended.",
+                       "정확도: 보여준 표정의 출력이 가장 높은 비율. 인식률: 그 표정의 출력이 0.5를 넘은 비율. "
+                       "오작동률: 다른 표정의 출력이 0.3을 넘은 비율 (엉뚱한 표정이 움직임, 낮을수록 좋음). "
+                       "점수 = (정확도 + 인식률 + 2 × (100% - 오작동률)) / 4. 최고점과 0.5점 이내면 같은 "
+                       "수준으로 보고 그중 가장 빠른 모델을 추천합니다."),
+    "compare_verdict": ("Recommended: %s + %s (score %.1f, %.2f ms per frame).",
+                        "추천: %s + %s (점수 %.1f, 프레임당 %.2f ms)."),
+    "compare_current": ("(current)", "(현재)"),
+    "compare_apply": ("Apply selected model", "선택한 모델 적용"),
+    "compare_applied": ("Now using %s + %s (saved).", "이제 %s + %s 모델을 사용합니다 (저장됨)."),
+    "close": ("Close", "닫기"),
     "val_stats": ("validation accuracy %.1f%% (loss %.5f)", "검증 정확도 %.1f%% (손실 %.5f)"),
     "train": ("Train", "학습 시작"),
     "stop": ("Stop", "중지"),

@@ -21,6 +21,8 @@ DEFAULT_CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 # (eye channels 0-63, face channels 64-127; a missing tracker is zero-filled),
 # so a recording made with both trackers can be reused for any mode.
 INPUT_MODES = ("both", "face", "eye")
+MODEL_ARCHS = ("standard", "lite", "compact")  # same names as model.ARCHS (kept here: no torch import)
+LOSSES = ("mse", "bce")
 INPUT_CHANNELS = {"both": slice(0, 128), "eye": slice(0, 64), "face": slice(64, 128)}
 
 
@@ -229,7 +231,12 @@ class Config:
     learning_rate: float = 5e-5
     mixed_precision: bool = True
     cache_datasets_in_ram: bool = False
-    model_arch: str = "standard"  # "standard" (original network) or "lite" (~8x smaller, faster)
+    # "standard" (original network), "lite" (~8x smaller) or "compact" (~30x smaller,
+    # standardised input; see model.py). The training tab's "Compare" picks one on your data.
+    model_arch: str = "standard"
+    # "mse": original (ReLU outputs, MSE against one-hot targets); "bce": sigmoid outputs
+    # trained with binary cross-entropy, each class independent of the others
+    loss: str = "mse"
     validation_split: float = 0.1  # end of each recording held out to measure accuracy; 0 = off
 
     # Inference
@@ -285,8 +292,10 @@ class Config:
 
     def validate(self):
         problems = []
-        if self.model_arch not in ("standard", "lite"):
-            problems.append("model_arch must be 'standard' or 'lite'.")
+        if self.model_arch not in MODEL_ARCHS:
+            problems.append("model_arch must be one of %s." % ", ".join(MODEL_ARCHS))
+        if self.loss not in LOSSES:
+            problems.append("loss must be one of %s." % ", ".join(LOSSES))
         if not 0 <= self.validation_split < 0.5:
             problems.append("validation_split must be between 0 and 0.5.")
         if self.input_mode not in INPUT_MODES:

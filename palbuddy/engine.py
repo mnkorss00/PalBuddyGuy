@@ -71,6 +71,7 @@ class Engine:
         self.idle = False  # inference throttled because nothing receives the output
         self._full_rate_until = 0.0  # e.g. while the GUI measures sensitivity
         self._smoothed = {}
+        self.compare_results = None  # last model comparison (see compare_async)
 
     # ------------------------------------------------------------ lifecycle
     def start(self):
@@ -395,6 +396,9 @@ class Engine:
                     if init.arch != self.cfg.model_arch:
                         raise ValueError("The current model is a '%s' model; untick 'continue' to train a '%s' one"
                                          % (init.arch, self.cfg.model_arch))
+                    if init.output != trainer.OUTPUT_FOR_LOSS[self.cfg.loss]:
+                        raise ValueError("The current model was trained with the other loss; untick 'continue' "
+                                         "to train a new one")
                 model, history = trainer.train(self.cfg, on_progress=on_progress, stop_event=self._train_stop,
                                                log_fn=log.info, init_model=init, device=self.device)
                 self.model = model
@@ -423,6 +427,103 @@ class Engine:
     def cancel_training(self):
         self._train_stop.set()
 
+    def compare_async(self, candidates=None, on_progress=None, on_done=None):
+        """Train several (arch, loss) candidates on the same frames, measure how well
+        each does on the held-out frames and how fast it runs here, and recommend one.
+        on_done(ok, message, results, best_index). Nothing is applied until
+        apply_candidate()."""
+        from . import trainer  # imports torch
+        if self.busy:
+            raise RuntimeError("Already %s" % self.busy)
+        problems = self.cfg.validate()
+        if problems:
+            raise ValueError("\n".join(problems))
+        candidates = tuple(candidates or trainer.DEFAULT_CANDIDATES)
+        if not candidates:
+            raise ValueError("Pick at least one model to compare")
+        self.stop_inference()
+        self.busy = "comparing"
+        self._train_stop.clear()
+
+        def run():
+            ok, message, results, best = False, "", [], None
+            try:
+                results = trainer.compare(self.cfg, candidates, on_progress=on_progress,
+                                          stop_event=self._train_stop, log_fn=log.info, device=self.device)
+                for r in results:
+                    r.update(self._measure(r["model"]))
+                best = trainer.recommend(results)
+                self.compare_results = results
+                ok = True
+                r = results[best]
+                message = "Compared %d models. Recommended: %s + %s (score %.1f, %.2f ms)" % (
+                    len(results), r["arch"], r["loss"].upper(), r["metrics"]["val_score"], r["ms"])
+            except trainer.TrainingCancelled:
+                message = "Comparison cancelled"
+            except Exception as e:
+                log.exception("comparison failed")
+                message = "Comparison failed: %s" % e
+            finally:
+                self.busy = None
+                if self.device.type == "cuda":
+                    import torch
+                    torch.cuda.empty_cache()
+            log.info(message)
+            if on_done:
+                on_done(ok, message, results, best)
+
+        threading.Thread(target=run, daemon=True, name="compare").start()
+
+    def _measure(self, model, frames=150):
+        """Tracking cost of a model on this PC with the configured CPU settings:
+        {"ms": per frame, "backend", "params", "size_mb": file size used for tracking}."""
+        import numpy as np
+        params = sum(p.numel() for p in model.parameters())
+        channels = 128 if model.input_mode == "both" else 64
+        x = np.random.default_rng(0).random((1, channels, 20, 20), dtype=np.float32)
+        if onnx_runtime.available():
+            from .onnx_export import export_onnx
+            base = os.path.join(tempfile.gettempdir(), "palbuddy-compare-%d" % os.getpid())
+            paths = export_onnx(model, base)
+            rt = onnx_runtime.OnnxRuntime(base, "cpu", self.cfg.infer_threads, self.cfg.infer_int8)
+            size = os.path.getsize(paths["int8"] if rt.quantized else paths["fp32"])
+        else:
+            from .inference import Runtime
+            rt = Runtime(model, "cpu", self.cfg.infer_threads, self.cfg.infer_int8)
+            size = params * (1 if rt.quantized else 4)
+        rt.activate()
+        try:
+            for _ in range(15):
+                rt.predict_array(x)
+            t0 = time.perf_counter()
+            for _ in range(frames):
+                rt.predict_array(x)
+            ms = (time.perf_counter() - t0) / frames * 1000
+        finally:
+            rt.release()
+        return {"ms": ms, "backend": rt.describe(), "params": params, "size_mb": size / 1e6}
+
+    def apply_candidate(self, result):
+        """Use a compared model right away: it becomes the current model, is saved to
+        the model path (the previous file is kept as <name>.prev.pt) and tracking
+        restarts with it if it was running."""
+        if self.busy:
+            raise RuntimeError("Wait until %s has finished" % self.busy)
+        was_inferring = self.inferring
+        self.stop_inference()
+        path = self.cfg.model_path
+        if os.path.exists(path):
+            import shutil
+            shutil.copy2(path, self.model_base(path) + ".prev.pt")
+        self.model = result["model"].eval()
+        self.model.val_metrics = result["metrics"]
+        self.cfg.model_arch, self.cfg.loss = result["arch"], result["loss"]
+        self.save_model(path)
+        self.save_config()
+        log.info("Now using the %s + %s model", result["arch"], result["loss"].upper())
+        if was_inferring:
+            self.start_inference()
+
     # ------------------------------------------------------------ inference
     @property
     def inferring(self):
@@ -431,7 +532,7 @@ class Engine:
     def start_inference(self):
         if self.inferring:
             return
-        if self.busy == "training":
+        if self.busy in ("training", "comparing"):
             raise RuntimeError("Wait for training to finish")
         runtime = self._make_runtime()  # errors surface here, in the caller
         from .params import V1_UNSUPPORTED

@@ -15,8 +15,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
-from .config import (MAX_BINARY_BITS, OSC_FORMATS, RANGE_PRESETS, ExpressionClass, MergedParam, MergedTerm,
-                     class_output_problems, merged_param_problems)
+from .config import (LOSSES, MAX_BINARY_BITS, MODEL_ARCHS, OSC_FORMATS, RANGE_PRESETS, ExpressionClass,
+                     MergedParam, MergedTerm, class_output_problems, merged_param_problems)
 from .datasets import frame_count
 from .engine import dataset_files
 from .frames import decode_camera
@@ -330,6 +330,148 @@ class MergedDialog(tk.Toplevel):
         self.destroy()
 
 
+class CompareDialog(tk.Toplevel):
+    """Train several model / loss combinations on the same recordings, show how each
+    does on the held-out frames and how fast it runs here, and apply the one picked."""
+
+    COLUMNS = ("loss", "score", "acc", "hit", "false", "ms", "size")
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        from .trainer import DEFAULT_CANDIDATES
+        self.app = app
+        t = app.t
+        self.title(t("compare_title"))
+        self.transient(app.root)
+        self.results, self.best = [], None
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=t("compare_help"), wraplength=640, justify="left").pack(anchor="w")
+
+        pick = ttk.LabelFrame(frm, text=t("compare_pick"), padding=6)
+        pick.pack(fill="x", pady=(8, 4))
+        self.picks = []
+        for i, (arch, loss) in enumerate(DEFAULT_CANDIDATES):
+            var = tk.BooleanVar(value=True)
+            self.picks.append((arch, loss, var))
+            ttk.Checkbutton(pick, text="%s + %s" % (app.arch_labels[arch], app.loss_labels[loss]),
+                            variable=var).grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 16))
+        ttk.Label(frm, text=t("compare_epochs") % app.cfg.epochs, foreground="#666").pack(anchor="w")
+
+        ctl = ttk.Frame(frm)
+        ctl.pack(fill="x", pady=4)
+        self.start_btn = ttk.Button(ctl, text=t("compare_start"), command=self.start)
+        self.start_btn.pack(side="left")
+        ttk.Button(ctl, text=t("stop"), command=app.engine.cancel_training).pack(side="left", padx=4)
+        self.bar = ttk.Progressbar(frm, maximum=1.0)
+        self.bar.pack(fill="x", pady=(4, 2))
+        self.status = ttk.Label(frm, text="")
+        self.status.pack(anchor="w")
+
+        box = ttk.LabelFrame(frm, text=t("compare_results"), padding=6)
+        box.pack(fill="both", expand=True, pady=(6, 0))
+        self.tree = ttk.Treeview(box, columns=self.COLUMNS, show="tree headings", height=6, selectmode="browse")
+        self.tree.heading("#0", text=t("arch"))
+        self.tree.column("#0", width=190)
+        for col in self.COLUMNS:
+            self.tree.heading(col, text=t("cmp_" + col))
+            self.tree.column(col, width=96 if col == "loss" else 72, anchor="w" if col == "loss" else "e")
+        self.tree.tag_configure("best", background="#dff3e3")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", lambda e: self.apply())
+        ttk.Label(box, text=t("compare_legend"), foreground="#666", wraplength=640, justify="left").pack(
+            anchor="w", pady=(4, 0))
+        self.verdict = ttk.Label(frm, text="", wraplength=640, justify="left")
+        self.verdict.pack(anchor="w", pady=(6, 0))
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(8, 0))
+        self.apply_btn = ttk.Button(btns, text=t("compare_apply"), command=self.apply)
+        self.apply_btn.pack(side="left")
+        self.apply_btn.state(["disabled"])
+        ttk.Button(btns, text=t("close"), command=self.close).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+    def close(self):
+        if self.app.engine.busy != "comparing":
+            self.app.engine.compare_results = None  # the trained candidates hold a few hundred MB
+        self.results = []
+        self.destroy()
+
+    def start(self):
+        candidates = [(a, l) for a, l, var in self.picks if var.get()]
+        app = self.app
+        try:
+            app.engine.compare_async(
+                candidates,
+                on_progress=lambda **info: app.events.put(("compare_progress", info)),
+                on_done=lambda ok, m, r, b: app.events.put(("compare_done", ok, m, r, b)))
+        except Exception as e:
+            app._error(e)
+            return
+        self.start_btn.state(["disabled"])
+        self.apply_btn.state(["disabled"])
+        self.tree.delete(*self.tree.get_children())
+        self.verdict.configure(text="")
+        self.bar["value"] = 0
+        self.status.configure(text=app.t("compare_running"))
+
+    def progress(self, info):
+        k, n = info["candidate"], info["candidates"]
+        epoch = min(info["epoch"], info["epochs"] - 1)
+        done = (epoch * info["steps"] + info["step"]) / max(1, info["epochs"] * info["steps"])
+        if info.get("epoch_done"):
+            done = info["epoch"] / info["epochs"]
+        self.bar["value"] = (k + done) / n
+        self.status.configure(text=self.app.t("compare_progress") % (k + 1, n, min(info["epoch"] + 1, info["epochs"]),
+                                                                      info["epochs"]))
+
+    def done(self, ok, message, results, best):
+        self.start_btn.state(["!disabled"])
+        if message:
+            self.status.configure(text=message)
+        if not ok:
+            return
+        self.bar["value"] = 1.0
+        self.results, self.best = results, best
+        t = self.app.t
+        self.tree.delete(*self.tree.get_children())
+        for i, r in enumerate(results):
+            m = r["metrics"]
+            current = r["arch"] == self.app.cfg.model_arch and r["loss"] == self.app.cfg.loss
+            name = ("★ " if i == best else "") + self.app.arch_labels[r["arch"]]
+            self.tree.insert("", "end", iid=str(i), text=name, tags=("best",) if i == best else (), values=(
+                r["loss"].upper(), "%.1f" % m["val_score"], "%.1f%%" % (m["val_acc"] * 100),
+                "%.1f%%" % (m["val_hit"] * 100), "%.1f%%" % (m["val_false"] * 100), "%.2f" % r["ms"],
+                "%.1f" % r["size_mb"]))
+            if current and i != best:
+                self.tree.item(str(i), text=name + " " + t("compare_current"))
+        if best is not None:
+            self.tree.selection_set(str(best))
+            self.tree.see(str(best))
+            r = results[best]
+            self.verdict.configure(text=t("compare_verdict") % (
+                self.app.arch_labels[r["arch"]], r["loss"].upper(), r["metrics"]["val_score"], r["ms"]))
+            self.apply_btn.state(["!disabled"])
+
+    def apply(self):
+        sel = self.tree.selection()
+        if not sel or not self.results:
+            return
+        r = self.results[int(sel[0])]
+        app = self.app
+        try:
+            app.engine.apply_candidate(r)
+        except Exception as e:
+            app._error(e)
+            return
+        app.show_model_choice()
+        app._rebuild_bars()
+        app.train_status.configure(text=app.t("compare_applied") % (app.arch_labels[r["arch"]], r["loss"].upper()))
+        self.verdict.configure(text=app.t("compare_applied") % (app.arch_labels[r["arch"]], r["loss"].upper()))
+        self.done(True, "", self.results, self.best)
+
+
 class App:
     def __init__(self, engine):
         self.engine = engine
@@ -350,6 +492,7 @@ class App:
         self._photo = None
         self.loss_history = []
         self.last_val = None  # (validation loss, validation accuracy) of the last epoch
+        self.compare_dialog = None
         self.bars = {}
 
         self._build_status_bar()
@@ -674,11 +817,18 @@ class App:
         ttk.Checkbutton(opts2, text=t("amp"), variable=self.amp).pack(side="left")
         ttk.Checkbutton(opts2, text=t("cache"), variable=self.cache).pack(side="left", padx=12)
         ttk.Checkbutton(opts2, text=t("resume"), variable=self.resume).pack(side="left")
-        self.arch_labels = {a: t("arch_" + a) for a in ("standard", "lite")}
+        opts3 = ttk.Frame(tab)
+        opts3.pack(fill="x", pady=(0, 6))
+        self.arch_labels = {a: t("arch_" + a) for a in MODEL_ARCHS}
         self.arch_var = tk.StringVar(value=self.arch_labels.get(self.cfg.model_arch, self.arch_labels["standard"]))
-        ttk.Label(opts2, text=t("arch")).pack(side="left", padx=(16, 4))
-        ttk.Combobox(opts2, textvariable=self.arch_var, state="readonly", width=24,
+        ttk.Label(opts3, text=t("arch")).pack(side="left", padx=(0, 4))
+        ttk.Combobox(opts3, textvariable=self.arch_var, state="readonly", width=26,
                      values=list(self.arch_labels.values())).pack(side="left")
+        self.loss_labels = {k: t("loss_" + k) for k in LOSSES}
+        self.loss_var = tk.StringVar(value=self.loss_labels.get(self.cfg.loss, self.loss_labels["mse"]))
+        ttk.Label(opts3, text=t("loss_fn")).pack(side="left", padx=(16, 4))
+        ttk.Combobox(opts3, textvariable=self.loss_var, state="readonly", width=30,
+                     values=list(self.loss_labels.values())).pack(side="left")
 
         ctl = ttk.Frame(tab)
         ctl.pack(fill="x")
@@ -687,6 +837,8 @@ class App:
         ttk.Button(ctl, text=t("stop"), command=self.engine.cancel_training).pack(side="left", padx=4)
         ttk.Button(ctl, text=t("save_model"), command=self.on_save_model).pack(side="left", padx=(16, 4))
         ttk.Button(ctl, text=t("load_model"), command=self.on_load_model).pack(side="left")
+        self.compare_btn = ttk.Button(ctl, text=t("compare"), command=self.on_compare)
+        self.compare_btn.pack(side="left", padx=(16, 0))
         self.train_progress = ttk.Progressbar(tab, maximum=1.0)
         self.train_progress.pack(fill="x", pady=(8, 2))
         self.train_status = ttk.Label(tab, text="")
@@ -1324,14 +1476,46 @@ class App:
         self.refresh_classes()
         self.refresh_merged()
 
+    def _read_train_options(self):
+        self.cfg.epochs = int(self.epochs.get())
+        self.cfg.batch_size = int(self.batch.get())
+        self.cfg.learning_rate = float(self.lr.get())
+        self.cfg.mixed_precision = bool(self.amp.get())
+        self.cfg.cache_datasets_in_ram = bool(self.cache.get())
+        self.cfg.model_arch = next(a for a, text in self.arch_labels.items() if text == self.arch_var.get())
+        self.cfg.loss = next(k for k, text in self.loss_labels.items() if text == self.loss_var.get())
+
+    def show_model_choice(self):
+        """Put the current config's model/loss back into the training tab's boxes."""
+        self.arch_var.set(self.arch_labels[self.cfg.model_arch])
+        self.loss_var.set(self.loss_labels[self.cfg.loss])
+
+    def on_compare(self):
+        try:
+            self._read_train_options()
+            self.engine.save_config()
+        except Exception as e:
+            self._error(e)
+            return
+        if self.compare_dialog is not None and self.compare_dialog.winfo_exists():
+            self.compare_dialog.lift()
+            return
+        self.compare_dialog = CompareDialog(self)
+
+    def _ev_compare_progress(self, info):
+        if self.compare_dialog is not None and self.compare_dialog.winfo_exists():
+            self.compare_dialog.progress(info)
+
+    def _ev_compare_done(self, ok, message, results, best):
+        self.train_status.configure(text=message)
+        if ok and (self.compare_dialog is None or not self.compare_dialog.winfo_exists()):
+            self.compare_dialog = CompareDialog(self)  # closed meanwhile: show the results anyway
+        if self.compare_dialog is not None and self.compare_dialog.winfo_exists():
+            self.compare_dialog.done(ok, message, results, best)
+
     def on_train(self):
         try:
-            self.cfg.epochs = int(self.epochs.get())
-            self.cfg.batch_size = int(self.batch.get())
-            self.cfg.learning_rate = float(self.lr.get())
-            self.cfg.mixed_precision = bool(self.amp.get())
-            self.cfg.cache_datasets_in_ram = bool(self.cache.get())
-            self.cfg.model_arch = next(a for a, text in self.arch_labels.items() if text == self.arch_var.get())
+            self._read_train_options()
             self.last_val = None
             self.engine.save_config()
             self.loss_history = []

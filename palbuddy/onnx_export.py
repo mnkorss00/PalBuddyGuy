@@ -69,6 +69,7 @@ def export_onnx(model, base, class_names=None, quantize=True):
                 os.remove(paths["int8"])  # never leave a stale int8 file for a new model
 
     meta = {"input_mode": model.input_mode, "num_outputs": model.num_outputs, "arch": getattr(model, "arch", "standard"),
+            "output": getattr(model, "output", "relu"),
             "class_names": list(class_names) if class_names else None, "int8": int8}
     with open(paths["meta"] + ".tmp", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

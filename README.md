@@ -85,11 +85,39 @@ Tracking runs the network on every new frame, about 60 times a second. These set
 
 **Benchmark this PC** times every available backend with your model, so you can pick what works best on your machine. The Live tab shows the running backend, the time per frame and the whole process's CPU use.
 
-### Lite model (Train tab → Model)
-*lite* has the same layout with fewer channels: about 8× fewer weights and about 5× less compute. Whether it tracks as well as *standard* depends on your recordings. To compare them, train both and look at the **validation accuracy**.
+### Model and training method (Train tab)
+| Model | Weights | Compute | |
+|---|---|---|---|
+| *standard* | 27 M | 115 M multiply-adds | the original network |
+| *lite* | 3.6 M | 33 M | same layout, fewer channels |
+| *compact* | 0.9 M | 11 M | built for small datasets: input features standardised per channel (statistics from your recordings, stored in the model), 1×1 conv 128→64, small head |
+
+97 % of the standard model's weights sit in one linear layer, which is a lot for a few minutes of recordings; smaller models overfit less, so they can be *more* accurate, not only faster. Which one is best depends on your recordings.
+
+| Training method | |
+|---|---|
+| *MSE* (original) | ReLU outputs trained towards a one-hot target: the classes compete with each other. |
+| *BCE* | Sigmoid outputs trained with binary cross-entropy: every class independently answers "is this expression showing". |
+
+Every run keeps the weights of the epoch that did best on the held-out frames, so training too long doesn't hurt.
+
+### Compare models & pick (Train tab)
+**Compare models & pick…** trains the selected combinations (by default standard/lite/compact with MSE and BCE) on the same recordings with the same sampling, scores each on the held-out frames and times it on this PC with your inference settings. The table shows:
+
+| Column | Meaning |
+|---|---|
+| Accuracy | the shown expression has the highest output |
+| Recognised | the shown expression's output is above 0.5 |
+| False act. | another expression's output is above 0.3, i.e. a wrong shape would move (lower is better) |
+| Score | (accuracy + recognised + 2 × (100 % − false act.)) / 4 |
+| ms/frame, MB | tracking cost on this PC |
+
+The recommended row is marked ★: the highest score, and among models within 0.5 points of it the fastest. Select any row and press **Apply selected model** (or double-click it): it becomes the current model at once, is saved to the model file (the previous file is kept as `<name>.prev.pt`), the Train tab's choices are updated, and tracking restarts with it if it was running. CLI: `compare`, `arch`, `loss`.
+
+After switching model or method, run FastCal once: the output scale of a new model can differ a little, and max_power is per model.
 
 ### Validation accuracy
-Training holds out the last 10 % of every recording (`validation_split` in `config.json`) and reports validation loss and accuracy after each epoch, plus the worst classes at the end. The hold-out is taken from the end of each recording rather than as random frames, because neighbouring frames are nearly identical and a random split would overstate accuracy.
+Training holds out the last 10 % of every recording (`validation_split` in `config.json`) and reports accuracy, recognised, false activations and the score after each epoch, plus the worst classes at the end. The hold-out is taken from the end of each recording rather than as random frames, because neighbouring frames are nearly identical and a random split would overstate accuracy. It is still the same session as the training frames, so the numbers are optimistic; they are meant for comparing models, not as absolute accuracy.
 
 ### Measurements
 One 2.8 GHz Xeon core, frames arriving at 60 Hz, whole-process CPU as % of one core, memory measured while tracking:
@@ -189,7 +217,8 @@ If you want the receiver in its own process, run `python tvm_proxy.py` and set t
 6. **학습** 탭: 클래스별로 녹화 파일과 대상 파라미터를 지정합니다 (첫 번째 클래스는 neutral). *학습 시작*을 누르고, 손실이 0.001 아래로 내려가면 *모델 저장*을 누릅니다.
 7. **실시간** 탭: *트래킹 시작*을 누른 뒤 *빠른 보정(FastCal)*으로 아바타를 따라 하며 보정합니다.
 
-8. **설정 탭 → 추론 성능**: 기본값(자동: ONNX Runtime, CPU int8)으로도 가볍게 돌아갑니다. *이 PC에서 비교 측정*을 누르면 CPU/GPU/ONNX 중 어느 쪽이 이 PC에 맞는지 바로 확인할 수 있습니다. 학습 탭에서 *모델 크기 → 경량*을 고르면 추론이 약 5배 빨라집니다. 표준 모델과 검증 정확도를 비교해 보고 결정하세요.
+8. **설정 탭 → 추론 성능**: 기본값(자동: ONNX Runtime, CPU int8)으로도 가볍게 돌아갑니다. *이 PC에서 비교 측정*을 누르면 CPU/GPU/ONNX 중 어느 쪽이 이 PC에 맞는지 바로 확인할 수 있습니다.
+   **학습 탭 → 모델 비교 후 선택…**: 표준/경량/컴팩트 모델 × MSE/BCE 학습 방식을 같은 녹화로 각각 학습해서 **정확도·인식률·오작동률·점수**와 이 PC에서의 **속도**를 표로 보여 줍니다. ★ 표시가 추천 모델(최고 점수, 0.5점 이내면 더 빠른 쪽)입니다. 원하는 줄을 고르고 *선택한 모델 적용*을 누르면 바로 그 모델로 트래킹합니다 (자동 저장, 이전 모델은 `.prev.pt`로 보관). 모델을 바꾼 뒤에는 FastCal을 한 번 해 주세요. *컴팩트*는 표준보다 가중치가 약 30배 적어 과적합이 덜하고, *BCE*는 표정마다 독립적으로 학습합니다.
 9. **설정 탭 → VRCFaceTracking 모듈 → 설치**: VRCFaceTracking v6용 모듈을 설치합니다. 먼저 VRCFaceTracking에서 SRanipal 모듈을 설치해 두세요. 설치하면 SRanipal 모듈은 Pal Buddy Guy 모듈 안에서 실행됩니다. v6는 눈과 표정을 각각 모듈 하나만 담당할 수 있기 때문입니다. 설치 후 VRCFaceTracking을 다시 시작하세요. *제거*를 누르면 원래대로 돌아갑니다. 대상 파라미터로 `BrowLowererLeft` 같은 **눈썹/눈 주변 표정**도 고를 수 있습니다.
 10. **프로세스 우선순위**: 기본값은 "보통 이하"라서 VR/게임에 CPU를 양보합니다. 12세대 이후 Intel CPU에서는 *E코어만 사용*, Windows 11에서는 *효율 모드*도 쓸 수 있습니다.
 11. **OSC 직접 출력**: 병합 파라미터 탭에서 **여러 클래스를 가중치로** 합치거나(예: 웃음 × 1 + 슬픔 × -1, 넓힘 × 0.2 + 뜸 × 0.8 + 찡그림 × -1; 범위 -1~1 / 0~1 / 0~2 / 직접 입력, **중간값 직접 설정**), 학습 탭의 클래스 설정에서 *OSC 파라미터* 이름을 지정해 클래스 값(0~1)을 VRChat에 직접 보낼 수 있습니다. 형식은 **float / 바이너리 / 둘 다** 중에서 고르고, 바이너리는 **1~8비트**로 VRCFT 바이너리와 같은 방식입니다. **VRCFT가 쓰는 이름(v1/v2, 바이너리, `/이름` 경로 포함)은 사용할 수 없게 막아서** 기존 페이셜에 영향이 가지 않습니다. `PBG_SmileSad`처럼 고유한 이름을 쓰세요.

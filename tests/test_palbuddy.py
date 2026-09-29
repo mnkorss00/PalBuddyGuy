@@ -1097,5 +1097,153 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.validate(), [])
 
 
+class CompactModelAndCompareTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _cfg(self, **kw):
+        make_recordings(self.tmp.name, {"n": 0.0, "s": 1.0, "m": -1.0}, frames=64)
+        opts = dict(dataset_folder=self.tmp.name, epochs=2, batch_size=32, mixed_precision=False,
+                    validation_split=0.2, model_path=os.path.join(self.tmp.name, "m.pt"),
+                    face_port=0, eye_port=0, vrcft_port=0, infer_device="cpu",
+                    classes=[ExpressionClass("neutral", ["n.mmap"]), ExpressionClass("smile", ["s.mmap"], "JawOpen"),
+                             ExpressionClass("mad", ["m.mmap"], "MouthPout")])
+        opts.update(kw)
+        return Config(**opts)
+
+    def test_compact_sigmoid_roundtrip(self):
+        from palbuddy.model import model_size
+        m = BuddyNet(3, "face", "compact", "sigmoid")
+        self.assertLess(sum(p.numel() for p in m.parameters()) * 25, sum(p.numel() for p in BuddyNet(3).parameters()))
+        self.assertLess(model_size("compact")[1] * 8, model_size("standard")[1])
+        m.set_normalization(np.arange(64) * 0.1, np.full(64, 2.0))
+        m.eval()
+        x = torch.randn(2, 64, 20, 20)
+        y = m(x)
+        self.assertTrue(((y >= 0) & (y <= 1)).all())
+        torch.testing.assert_close(torch.sigmoid(m(x, logits=True)), y)
+        path = os.path.join(self.tmp.name, "c.pt")
+        m.save(path, ["a", "b", "c"])
+        loaded = BuddyNet.load(path, expected_outputs=3, expected_mode="face").eval()
+        self.assertEqual((loaded.arch, loaded.output, loaded.input_mode), ("compact", "sigmoid", "face"))
+        torch.testing.assert_close(loaded(x), y)
+        # the normalisation is part of the model: different inputs statistics -> different outputs
+        loaded.set_normalization(np.zeros(64), np.ones(64))
+        self.assertFalse(torch.allclose(loaded(x), y))
+
+    def test_old_checkpoints_still_load_as_relu(self):
+        path = os.path.join(self.tmp.name, "old.pt")
+        std = BuddyNet(2)
+        torch.save({k: getattr(std, k).state_dict() for k in ("conv1", "conv2", "linear1", "linear2")}, path)
+        m = BuddyNet.load(path)
+        self.assertEqual((m.arch, m.output), ("standard", "relu"))
+
+    @unittest.skipUnless(__import__("importlib").util.find_spec("onnxruntime"), "onnxruntime not installed")
+    def test_compact_onnx_matches_torch(self):
+        from palbuddy.onnx_export import export_onnx
+        from palbuddy.onnx_runtime import OnnxRuntime, read_meta
+        m = BuddyNet(3, "both", "compact", "sigmoid")
+        m.set_normalization(np.linspace(0, 1, 128), np.linspace(0.5, 2, 128))
+        m.eval()
+        base = os.path.join(self.tmp.name, "c")
+        paths = export_onnx(m, base)
+        self.assertEqual(read_meta(base)["output"], "sigmoid")
+        x = np.random.default_rng(2).random((1, 128, 20, 20), dtype=np.float32)
+        with torch.no_grad():
+            ref = m(torch.from_numpy(x))[0].numpy()
+        np.testing.assert_allclose(OnnxRuntime(base, "cpu", 1, int8=False).predict_array(x), ref, atol=1e-5)
+        if os.path.exists(paths["int8"]):
+            self.assertLess(np.abs(OnnxRuntime(base, "cpu", 1, int8=True).predict_array(x) - ref).max(), 0.05)
+
+    def test_train_compact_bce(self):
+        cfg = self._cfg(model_arch="compact", loss="bce", epochs=3)
+        model, history = train(cfg, log_fn=lambda *a: None, device=torch.device("cpu"))
+        self.assertEqual((model.arch, model.output), ("compact", "sigmoid"))
+        self.assertTrue(model.in_scale.ne(1).any())  # input statistics were computed
+        mt = model.val_metrics
+        for key in ("val_acc", "val_hit", "val_false", "val_score", "epoch", "per_class"):
+            self.assertIn(key, mt)
+        self.assertGreater(mt["val_acc"], 0.9)
+        self.assertLess(mt["val_false"], 0.2)
+        with self.assertRaises(ValueError):  # a sigmoid model can't continue with MSE
+            train(cfg, log_fn=lambda *a: None, device=torch.device("cpu"), init_model=model, loss="mse")
+
+    def test_evaluate_metrics(self):
+        from palbuddy.trainer import evaluate
+
+        class Fixed(torch.nn.Module):
+            def __init__(self, out):
+                super().__init__()
+                self.out = torch.tensor(out)
+
+            def forward(self, x):
+                return self.out[x[:, 0, 0, 0].long()]
+
+        # frame 0: class 0 shown, clean; frame 1: class 1 shown, weak (0.4) and class 0 also at 0.35
+        out = [[0.9, 0.1], [0.35, 0.4]]
+        x = np.zeros((2, 1, 1, 1), np.float32)
+        x[1] = 1
+        m = evaluate(Fixed(out), x, np.array([0, 1]), 2, torch.device("cpu"))
+        self.assertEqual((m["acc"], m["hit"], m["false"]), (1.0, 0.5, 0.5))
+        self.assertAlmostEqual(m["score"], 100 * (1 + 0.5 + 2 * 0.5) / 4)
+
+    def test_recommend_prefers_fast_among_equals(self):
+        from palbuddy.trainer import recommend
+        r = lambda score, ms: {"metrics": {"val_score": score}, "ms": ms, "params": 1}
+        self.assertEqual(recommend([r(90.0, 5.0), r(89.8, 0.5), r(80.0, 0.1)]), 1)
+        self.assertEqual(recommend([r(90.0, 5.0), r(88.0, 0.5)]), 0)
+        self.assertIsNone(recommend([]))
+
+    def test_config_rejects_unknown_loss_and_arch(self):
+        cfg = self._cfg(loss="huber")
+        self.assertTrue(any("loss" in p for p in cfg.validate()))
+        cfg.loss, cfg.model_arch = "bce", "huge"
+        self.assertTrue(any("model_arch" in p for p in cfg.validate()))
+        cfg.model_arch = "compact"
+        self.assertEqual(cfg.validate(), [])
+
+    def test_engine_compare_and_apply(self):
+        cfg = self._cfg(epochs=1)
+        engine = Engine(cfg)
+        engine.device = torch.device("cpu")
+        engine.start()
+        self.addCleanup(engine.stop)
+        engine.model = BuddyNet(3)
+        engine.save_model()  # an existing model: kept as .prev.pt when another one is applied
+        engine.start_inference()
+        self.assertTrue(wait_for(lambda: engine.infer_backend is not None))
+        done = threading.Event()
+        out = {}
+        seen = []
+        engine.compare_async([("lite", "mse"), ("compact", "bce")], on_progress=lambda **i: seen.append(i),
+                             on_done=lambda ok, m, r, b: (out.update(ok=ok, m=m, r=r, b=b), done.set()))
+        self.assertFalse(engine.inferring)  # paused while comparing
+        self.assertTrue(done.wait(300), "comparison did not finish")
+        self.assertTrue(out["ok"], out["m"])
+        self.assertEqual([(r["arch"], r["loss"]) for r in out["r"]], [("lite", "mse"), ("compact", "bce")])
+        self.assertEqual({i["candidate"] for i in seen}, {0, 1})
+        for r in out["r"]:
+            self.assertGreater(r["ms"], 0)
+            self.assertGreater(r["size_mb"], 0)
+        self.assertLess(out["r"][1]["params"], out["r"][0]["params"])
+        self.assertIn(out["b"], (0, 1))
+
+        engine.start_inference()
+        engine.apply_candidate(out["r"][1])
+        self.assertEqual((cfg.model_arch, cfg.loss), ("compact", "bce"))
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "m.prev.pt")))
+        self.assertEqual(BuddyNet.load(cfg.model_path).arch, "compact")
+        self.assertTrue(engine.inferring)  # tracking resumed with the new model
+        self.assertTrue(wait_for(lambda: engine.infer_backend is not None))
+        engine.stop_inference()
+
+    def test_compare_needs_validation_frames(self):
+        from palbuddy.trainer import compare
+        cfg = self._cfg(validation_split=0.0)
+        with self.assertRaises(ValueError):
+            compare(cfg, [("lite", "mse")], log_fn=lambda *a: None, device=torch.device("cpu"))
+
+
 if __name__ == "__main__":
     unittest.main()
