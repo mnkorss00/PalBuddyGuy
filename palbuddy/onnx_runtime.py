@@ -47,6 +47,7 @@ class OnnxRuntime:
         self.input_mode = meta["input_mode"]
         self.num_outputs = meta["num_outputs"]
         self.arch = meta.get("arch", "standard")
+        self.output = meta.get("output", "relu")
         if expected_mode is not None and self.input_mode != expected_mode:
             raise ValueError("ONNX model %s was trained for input '%s' but '%s' is selected"
                              % (paths["fp32"], self.input_mode, expected_mode))

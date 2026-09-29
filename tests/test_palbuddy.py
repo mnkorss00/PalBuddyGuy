@@ -1238,6 +1238,22 @@ class CompactModelAndCompareTests(unittest.TestCase):
         self.assertTrue(wait_for(lambda: engine.infer_backend is not None))
         engine.stop_inference()
 
+    def test_softener(self):
+        from palbuddy.engine import softener
+        self.assertIsNone(softener(1.0))
+        f = softener(3.0)
+        self.assertEqual((f(0.0), f(0.005), f(1.0)), (0.0, 0.0, 1.0))  # neutral stays 0, full stays 1
+        self.assertAlmostEqual(f(0.5), 0.5)
+        vals = [f(p) for p in (0.05, 0.2, 0.5, 0.8, 0.95)]
+        self.assertEqual(vals, sorted(vals))
+        self.assertGreater(f(0.05), 0.05)  # the steep ends of the sigmoid are spread out
+        self.assertLess(f(0.95), 0.95)
+
+    def test_runtimes_report_output_kind(self):
+        from palbuddy.inference import Runtime
+        self.assertEqual(Runtime(BuddyNet(2, arch="compact", output="sigmoid"), "cpu").output, "sigmoid")
+        self.assertEqual(Runtime(BuddyNet(2, arch="lite"), "cpu").output, "relu")
+
     def test_compare_needs_validation_frames(self):
         from palbuddy.trainer import compare
         cfg = self._cfg(validation_split=0.0)

@@ -80,6 +80,7 @@ class Runtime:
         self.threads = threads
         self.input_mode = model.input_mode
         self.num_outputs = model.num_outputs
+        self.output = getattr(model, "output", "relu")
         base = copy.deepcopy(model).float().eval().to(self.device)
         self.quantized = False
         if self.device.type == "cpu" and int8:

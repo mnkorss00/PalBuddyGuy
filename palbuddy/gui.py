@@ -575,6 +575,16 @@ class App:
         self.smoothing = tk.DoubleVar(value=self.cfg.smoothing)
         ttk.Scale(ctl, from_=0.0, to=0.9, variable=self.smoothing, length=140,
                   command=self.on_smoothing).pack(side="left")
+        soft_row = ttk.Frame(right)
+        soft_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(soft_row, text=t("softness")).pack(side="left")
+        self.softness = tk.DoubleVar(value=self.cfg.softness)
+        ttk.Scale(soft_row, from_=1.0, to=4.0, variable=self.softness, length=140,
+                  command=self.on_softness).pack(side="left", padx=4)
+        self.softness_label = ttk.Label(soft_row, text="", width=5)
+        self.softness_label.pack(side="left")
+        ttk.Label(soft_row, text=t("softness_help"), foreground="#666").pack(side="left", padx=(6, 0))
+        self._show_softness()
         self.infer_stats = ttk.Label(right, text=t("not_tracking"))
         self.infer_stats.pack(anchor="w", pady=(6, 0))
         self.fastcal_label = ttk.Label(right, text=t("fastcal_help"), foreground="#666")
@@ -1356,6 +1366,14 @@ class App:
 
     def on_smoothing(self, _value=None):
         self.cfg.smoothing = round(float(self.smoothing.get()), 2)
+
+    def on_softness(self, _value=None):
+        self.cfg.softness = round(float(self.softness.get()), 1)
+        self._show_softness()
+
+    def _show_softness(self):
+        v = self.cfg.softness
+        self.softness_label.configure(text=self.t("off") if v <= 1.0 else "×%.1f" % v)
 
     def on_toggle_infer(self):
         try:

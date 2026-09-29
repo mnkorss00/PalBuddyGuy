@@ -7,6 +7,7 @@ onnxruntime is installed, using exported .onnx files.
 
 import importlib.util
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -31,6 +32,31 @@ def normalize(raw, max_power):
     Plain Python: np.clip on a scalar costs ~20 us, and this runs per class per frame."""
     v = float(raw) / max_power * 2.0 - 1.0
     return -1.0 if v < -1.0 else (1.0 if v > 1.0 else v)
+
+
+SOFT_EDGE = 0.01  # softness keeps outputs of 1% / 99% at 0 / 1
+
+
+def softener(temperature):
+    """Output curve for sigmoid (BCE) models: divides the logit by `temperature`, so the
+    output rises gradually with the expression instead of snapping between 0 and 1,
+    then rescales so SOFT_EDGE still maps to 0 and 1 - SOFT_EDGE to 1 (neutral stays at 0).
+    Returns None for temperature <= 1 (off)."""
+    if temperature <= 1.0:
+        return None
+    inv = 1.0 / temperature
+    edge = math.log(SOFT_EDGE / (1.0 - SOFT_EDGE)) * inv
+    lo = 1.0 / (1.0 + math.exp(-edge))
+    span = 1.0 - 2.0 * lo
+
+    def soften(p):
+        if p <= SOFT_EDGE:
+            return 0.0
+        if p >= 1.0 - SOFT_EDGE:
+            return 1.0
+        v = (1.0 / (1.0 + math.exp(-math.log(p / (1.0 - p)) * inv)) - lo) / span
+        return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+    return soften
 
 
 class Engine:
@@ -636,6 +662,8 @@ class Engine:
         last_send = 0.0
         plan_at = -PLAN_REFRESH
         classes, targets, merged_params, interval = [], [], [], infer_interval
+        sigmoid_outputs = getattr(runtime, "output", "relu") == "sigmoid"
+        soften, soften_key = None, None
         waiting_logged = False
         log.info("Inference started (%s%s)", self.infer_backend,
                  ", max %.0f Hz" % cfg.max_infer_rate if infer_interval else "")
@@ -656,6 +684,8 @@ class Engine:
                 targets = [(idx, classes[idx].name, target) for idx, target, _ in cfg.targets() if idx < len(classes)]
                 self.osc_plan()
                 merged_params = self.active_merged_params()
+                if sigmoid_outputs and cfg.softness != soften_key:
+                    soften_key, soften = cfg.softness, softener(cfg.softness)
                 consumer = (targets and self.vrcft.connected) or (cfg.osc_enabled and self._osc_plan)
                 if self.idle != (not consumer):
                     self.idle = not consumer
@@ -699,7 +729,7 @@ class Engine:
             for idx, c in enumerate(classes):
                 if idx >= len(raw_values):
                     break
-                r = raw_values[idx] / c.max_power
+                r = (soften(raw_values[idx]) if soften else raw_values[idx]) / c.max_power
                 w_raw = 0.0 if r < 0.0 else (1.0 if r > 1.0 else r)
                 class_raw[idx] = w_raw
                 w = c.remap(w_raw)  # sensitivity range, e.g. 0.2..0.8 -> 0..1

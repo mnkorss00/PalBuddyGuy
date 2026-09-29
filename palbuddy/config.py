@@ -241,6 +241,9 @@ class Config:
 
     # Inference
     smoothing: float = 0.0  # 0 = off, otherwise EMA factor in (0, 1)
+    # BCE (sigmoid) models only: 1 = off; higher = outputs follow the expression more
+    # gradually instead of jumping between 0 and 1 (see engine.softener)
+    softness: float = 1.0
     max_send_rate: float = 120.0  # Hz cap for VRCFT updates
     # VRCFT v6 module: "replace" SRanipal's value of a driven shape, or keep the "max" of both
     vrcft_override_mode: str = "replace"
