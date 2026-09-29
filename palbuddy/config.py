@@ -40,6 +40,8 @@ class ExpressionClass:
     max_power: raw network output that maps to a fully expressed shape (+1).
     in_min, in_max: sensitivity - the part of the 0..1 range the expression really uses;
             stretched back to 0..1 (e.g. 0.2..0.8 -> 0..1).
+    stability: filters out brief changes (median + low-pass over up to STABILITY_WINDOW s), for
+            expressions that should hold rather than flicker along with speech.
     osc_name: optional custom avatar parameter the class weight (0..1) is sent to over OSC,
             as a float and/or binary bools (osc_format, osc_bits).
     """
@@ -50,6 +52,7 @@ class ExpressionClass:
     max_power: float = 0.9
     in_min: float = 0.0
     in_max: float = 1.0
+    stability: float = 0.0  # 0 = off .. 1 = strongest: ignore brief flickers (e.g. while talking)
     osc_name: Optional[str] = None
     osc_format: str = "float"
     osc_bits: int = 4

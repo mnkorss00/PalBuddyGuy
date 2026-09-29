@@ -1249,6 +1249,26 @@ class CompactModelAndCompareTests(unittest.TestCase):
         self.assertGreater(f(0.05), 0.05)  # the steep ends of the sigmoid are spread out
         self.assertLess(f(0.95), 0.95)
 
+    def test_stabilizer_ignores_speech_flicker_but_follows_held_expressions(self):
+        from palbuddy.engine import Stabilizer
+        st, t, out = Stabilizer(), 0.0, []
+        dt = 1 / 60
+        for i in range(60):  # 1 s neutral with a 150 ms flicker to 1.0 in the middle (a syllable)
+            t += dt
+            out.append(st.update(1.0 if 25 <= i < 34 else 0.0, t, 1.0))
+        self.assertLess(max(out), 0.05)
+        for _ in range(60):  # then the expression is held: reached within ~0.6 s
+            t += dt
+            v = st.update(1.0, t, 1.0)
+        self.assertGreater(v, 0.9)
+        # the same flicker passes unfiltered-ish with a weak setting
+        weak, t = Stabilizer(), 0.0
+        peak = 0.0
+        for i in range(60):
+            t += dt
+            peak = max(peak, weak.update(1.0 if 25 <= i < 34 else 0.0, t, 0.1))
+        self.assertGreater(peak, 0.5)
+
     def test_runtimes_report_output_kind(self):
         from palbuddy.inference import Runtime
         self.assertEqual(Runtime(BuddyNet(2, arch="compact", output="sigmoid"), "cpu").output, "sigmoid")

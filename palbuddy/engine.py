@@ -6,6 +6,7 @@ onnxruntime is installed, using exported .onnx files.
 """
 
 import importlib.util
+import collections
 import logging
 import math
 import os
@@ -59,6 +60,42 @@ def softener(temperature):
     return soften
 
 
+STABILITY_WINDOW = 0.4  # s: median window at stability 1 (a syllable is ~0.1-0.25 s)
+STABILITY_TAU = 0.3  # s: low-pass time constant at stability 1
+
+
+class Stabilizer:
+    """Per-class filter for expressions that should hold instead of flickering with
+    speech: a running median over the last stability * STABILITY_WINDOW seconds
+    removes short spikes, then a time-based low-pass evens out what's left. Time-based,
+    so it behaves the same at 30, 60 or 120 fps."""
+
+    __slots__ = ("samples", "value", "last")
+
+    def __init__(self):
+        self.samples = collections.deque()
+        self.value = None
+        self.last = None
+
+    def update(self, w, now, stability):
+        window = stability * STABILITY_WINDOW
+        samples = self.samples
+        samples.append((now, w))
+        while samples[0][0] < now - window:
+            samples.popleft()
+        ordered = sorted(v for _, v in samples)
+        n = len(ordered)
+        median = ordered[n // 2] if n % 2 else (ordered[n // 2 - 1] + ordered[n // 2]) * 0.5
+        if self.value is None:
+            self.value = median
+        else:
+            dt = now - self.last
+            a = dt / (dt + stability * STABILITY_TAU)
+            self.value += (median - self.value) * a
+        self.last = now
+        return self.value
+
+
 class Engine:
     def __init__(self, cfg: Config, config_path=None):
         self.cfg = cfg
@@ -97,6 +134,7 @@ class Engine:
         self.idle = False  # inference throttled because nothing receives the output
         self._full_rate_until = 0.0  # e.g. while the GUI measures sensitivity
         self._smoothed = {}
+        self._stabilizers = {}
         self.compare_results = None  # last model comparison (see compare_async)
 
     # ------------------------------------------------------------ lifecycle
@@ -568,6 +606,7 @@ class Engine:
                             "directions are driven instead", target)
         self._infer_stop.clear()
         self._smoothed = {}
+        self._stabilizers = {}
         self._infer_thread = threading.Thread(target=self._infer_loop, args=(runtime,), daemon=True,
                                               name="inference")
         self._infer_thread.start()
@@ -724,6 +763,7 @@ class Engine:
 
             # per-class weight 0..1 (raw / max_power), smoothed; VRCFT gets 2w-1 in -1..1
             alpha = cfg.smoothing
+            frame_time = time.monotonic()
             raw_values = raw.tolist()  # Python floats: much faster than indexing numpy per element
             weights, class_raw, final = {}, {}, {}
             for idx, c in enumerate(classes):
@@ -733,6 +773,11 @@ class Engine:
                 w_raw = 0.0 if r < 0.0 else (1.0 if r > 1.0 else r)
                 class_raw[idx] = w_raw
                 w = c.remap(w_raw)  # sensitivity range, e.g. 0.2..0.8 -> 0..1
+                if c.stability > 0.0:
+                    st = self._stabilizers.get(idx)
+                    if st is None:
+                        st = self._stabilizers[idx] = Stabilizer()
+                    w = st.update(w, frame_time, c.stability)
                 if 0.0 < alpha < 1.0:
                     prev = self._smoothed.get(idx, w)
                     w = prev * alpha + w * (1.0 - alpha)

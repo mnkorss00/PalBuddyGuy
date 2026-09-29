@@ -176,6 +176,11 @@ CLI: `merged add PBG_SmileSad smile,-sad -1 0 1 binary 4` (terms, min, neutral, 
 ## Sensitivity (Live tab)
 If a class only moves between, say, 0.2 and 0.8, stretch that part back to 0..1. Click the class in the output list, then drag **Low end** / **High end**; orange marks show them on the bar. **Auto (5 s)** measures it for you: make a neutral face, then the full expression, and the 5th–95th percentile of what it saw becomes the range. The top bar shows the value before the adjustment and the bottom bar what is sent. The adjustment applies to VRCFaceTracking shapes and OSC outputs alike. CLI: `sens smile 0.2 0.8`.
 
+### Stability and talking
+When emotion classes flicker while you talk, two things help:
+* **A talking recording.** Record 30 s of reading text aloud with a neutral face (again in another session) and add it either to `neutral` or, better, as its own class `talk` with no target. The network then learns that mouth movement from speech is not an emotion. This is the real fix.
+* **Stability** (Live tab, per class, below the sensitivity sliders): ignores changes shorter than the shown time (up to 400 ms; a syllable lasts ~100–250 ms), using a running median and a gentle low-pass. Set it on emotion classes and leave it off for mouth shapes that must follow speech. A held expression still comes through, just a fraction of a second later.
+
 ## 7. Process priority (Settings tab → Inference performance)
 Tracking needs very little CPU, so by default the process runs at **below normal** priority and yields to VR and the game when the CPU is busy. On hybrid Intel CPUs (12th gen and later, e.g. the i7-12700K), **Efficiency cores only** keeps it off the P-cores entirely. On Windows 11, **Efficiency mode** (EcoQoS) lets the scheduler run it on slow, low-power cores. *low* priority is available too, but tracking may stutter when the CPU is fully loaded.
 
@@ -225,5 +230,6 @@ If you want the receiver in its own process, run `python tvm_proxy.py` and set t
 10. **프로세스 우선순위**: 기본값은 "보통 이하"라서 VR/게임에 CPU를 양보합니다. 12세대 이후 Intel CPU에서는 *E코어만 사용*, Windows 11에서는 *효율 모드*도 쓸 수 있습니다.
 11. **OSC 직접 출력**: 병합 파라미터 탭에서 **여러 클래스를 가중치로** 합치거나(예: 웃음 × 1 + 슬픔 × -1, 넓힘 × 0.2 + 뜸 × 0.8 + 찡그림 × -1; 범위 -1~1 / 0~1 / 0~2 / 직접 입력, **중간값 직접 설정**), 학습 탭의 클래스 설정에서 *OSC 파라미터* 이름을 지정해 클래스 값(0~1)을 VRChat에 직접 보낼 수 있습니다. 형식은 **float / 바이너리 / 둘 다** 중에서 고르고, 바이너리는 **1~8비트**로 VRCFT 바이너리와 같은 방식입니다. **VRCFT가 쓰는 이름(v1/v2, 바이너리, `/이름` 경로 포함)은 사용할 수 없게 막아서** 기존 페이셜에 영향이 가지 않습니다. `PBG_SmileSad`처럼 고유한 이름을 쓰세요.
 12. **민감도 (실시간 탭)**: 출력 목록에서 클래스를 클릭하고 하한/상한 슬라이더를 조정하면, 예를 들어 0.2~0.8로만 움직이는 값을 0~1로 늘립니다. *자동 (5초)*을 누르고 무표정 → 최대 표정을 지으면 범위를 자동으로 잡아 줍니다.
+13. **말할 때 감정이 출렁이면**: 무표정으로 글을 소리 내어 읽는 녹화(30초, 다른 날 한 번 더)를 만들어 **대상 없는 `talk` 클래스**로 추가하고 다시 학습하세요. 근본 해결책입니다. 추가로 실시간 탭에서 감정 클래스를 클릭하고 **안정화** 슬라이더를 올리면 짧은 출렁임(최대 400ms 미만)을 무시합니다. 입 모양 클래스에는 끄세요.
 
 언어는 설정 탭에서 바꿀 수 있습니다 (auto / en / ko).

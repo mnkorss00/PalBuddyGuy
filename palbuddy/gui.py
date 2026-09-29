@@ -18,7 +18,7 @@ import numpy as np
 from .config import (LOSSES, MAX_BINARY_BITS, MODEL_ARCHS, OSC_FORMATS, RANGE_PRESETS, ExpressionClass,
                      MergedParam, MergedTerm, class_output_problems, merged_param_problems)
 from .datasets import frame_count
-from .engine import dataset_files
+from .engine import STABILITY_WINDOW, dataset_files
 from .frames import decode_camera
 from .i18n import Translator
 from .params import all_target_names
@@ -617,8 +617,15 @@ class App:
         btns.grid(row=0, column=3, rowspan=2, sticky="e")
         ttk.Button(btns, text=t("sens_auto"), command=self.on_sensitivity_auto).pack(fill="x")
         ttk.Button(btns, text=t("sens_reset"), command=self.on_sensitivity_reset).pack(fill="x", pady=(2, 0))
-        self.sens_hint = ttk.Label(box, text=t("sens_hint"), foreground="#666", wraplength=520, justify="left")
-        self.sens_hint.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.sens_stab = tk.DoubleVar(value=0.0)
+        ttk.Label(box, text=t("sens_stability"), width=10).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Scale(box, from_=0.0, to=1.0, variable=self.sens_stab, length=300,
+                  command=lambda _v: self.on_stability()).grid(row=2, column=1, sticky="ew", pady=(4, 0))
+        self.sens_stab_value = ttk.Label(box, text="", width=16)
+        self.sens_stab_value.grid(row=2, column=2, padx=6, pady=(4, 0))
+        self.sens_hint = ttk.Label(box, text=t("sens_hint") + "\n" + t("stability_hint"), foreground="#666",
+                                   wraplength=520, justify="left")
+        self.sens_hint.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
         box.columnconfigure(1, weight=1)
         self._select_sensitivity(None)
 
@@ -635,6 +642,7 @@ class App:
         self.sens_box.configure(text=t("sens_title") % c.name)
         self.sens_lo.set(c.in_min)
         self.sens_hi.set(c.in_max)
+        self.sens_stab.set(c.stability)
         self._show_sensitivity_values()
 
     def _show_sensitivity_values(self):
@@ -642,6 +650,18 @@ class App:
             return
         c = self.cfg.classes[self.sens_class]
         self.sens_value.configure(text="%.2f .. %.2f" % (c.in_min, c.in_max))
+        self.sens_stab_value.configure(text=self.t("off") if c.stability <= 0 else
+                                       self.t("stability_value") % (c.stability * STABILITY_WINDOW * 1000))
+
+    def on_stability(self):
+        if self.sens_class is None:
+            return
+        c = self.cfg.classes[self.sens_class]
+        c.stability = round(self.sens_stab.get(), 2)
+        self._show_sensitivity_values()
+        if self._sens_save_job:
+            self.root.after_cancel(self._sens_save_job)
+        self._sens_save_job = self.root.after(600, self.engine.save_config)
 
     def on_sensitivity(self, which):
         if self.sens_class is None:

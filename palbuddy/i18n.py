@@ -60,6 +60,12 @@ STRINGS = {
     "sens_title_none": ("Sensitivity (click a class above)", "민감도 (위 목록에서 클래스를 클릭)"),
     "sens_title": ("Sensitivity: %s", "민감도: %s"),
     "sens_low": ("Low end", "하한"),
+    "sens_stability": ("Stability", "안정화"),
+    "stability_value": ("ignores < %.0f ms", "%.0f ms 미만 무시"),
+    "stability_hint": ("Stability: ignores changes shorter than the shown time, e.g. emotions flickering while "
+                       "talking. Use it on emotions, keep it off for mouth shapes that must follow speech.",
+                       "안정화: 표시된 시간보다 짧은 변화를 무시합니다 (예: 말할 때 감정 표정이 출렁임). 감정 "
+                       "표정에만 쓰고, 말을 따라가야 하는 입 모양에는 끄세요."),
     "sens_high": ("High end", "상한"),
     "sens_auto": ("Auto (5 s)", "자동 (5초)"),
     "sens_reset": ("Reset", "초기화"),
