@@ -1,19 +1,23 @@
-"""Glue between frame input, the network and VRCFT output. Used by GUI and CLI."""
+"""Glue between frame input, the network and VRCFT output. Used by GUI and CLI.
 
+PyTorch is imported lazily: tracking with ONNX Runtime never loads it (a few
+hundred MB less RAM), and the app can even run tracking on a PC where only
+onnxruntime is installed, using exported .onnx files.
+"""
+
+import importlib.util
 import logging
 import os
+import tempfile
 import threading
 import time
 
 import numpy as np
-import torch
 
-from . import trainer
+from . import onnx_runtime
 from .config import Config
 from .datasets import Recorder, convert_legacy_pickles
-from .inference import Runtime, benchmark
 from .frames import FrameHub, ProxyClient, RateMeter, SRanipalReceiver
-from .model import BuddyNet, pick_device
 from .vrcft import VRCFTServer, encode_params
 
 log = logging.getLogger(__name__)
@@ -28,7 +32,7 @@ class Engine:
     def __init__(self, cfg: Config, config_path=None):
         self.cfg = cfg
         self.config_path = config_path
-        self.device = pick_device()
+        self._device = None  # training device, resolved on first use (imports torch)
         self.hub = FrameHub()
         self.source = None
         self.vrcft = None
@@ -62,8 +66,19 @@ class Engine:
                                            swapped=cfg.swapped, mode=cfg.input_mode,
                                            stall_timeout=cfg.stall_timeout).start()
         self.vrcft = VRCFTServer(cfg.bind_host, cfg.vrcft_port).start()
-        log.info("Compute device: %s", self.device)
         return self
+
+    @property
+    def device(self):
+        if self._device is None:
+            from .model import pick_device
+            self._device = pick_device()
+            log.info("Training device: %s", self._device)
+        return self._device
+
+    @device.setter
+    def device(self, value):
+        self._device = value
 
     def stop(self):
         self.stop_inference()
@@ -118,8 +133,8 @@ class Engine:
             "latency_ms": self.infer_latency_ms,
             "busy": self.busy,
             "fastcal": self.fastcal_state,
-            "device": str(self.device),
-            "model_loaded": self.model is not None,
+            "device": str(self._device) if self._device is not None else None,
+            "model_loaded": self.model is not None or self.inferring,
             "model_dirty": self.model_dirty,
             "swapped": self.cfg.swapped,
         }
@@ -151,13 +166,22 @@ class Engine:
     def model_path(self):
         return self.cfg.model_path
 
+    def model_base(self, path=None):
+        return os.path.splitext(path or self.cfg.model_path)[0]
+
     def load_model(self, path=None):
+        from .model import BuddyNet
         path = path or self.cfg.model_path
+        if path.endswith(".onnx"):
+            raise ValueError("Select the .pt file; the matching .onnx file is used automatically for tracking")
         # loaded on the CPU; the inference runtime / trainer move it where needed, so
         # CPU-only tracking never initialises CUDA (saves its VRAM context)
         self.model = BuddyNet.load(path, None, expected_outputs=self.cfg.num_classes,
                                    expected_mode=self.cfg.input_mode).eval()
         self.model_dirty = False
+        if path != self.cfg.model_path:
+            self.cfg.model_path = path
+            self.save_config()
         log.info("Loaded model %s", path)
         return self.model
 
@@ -168,6 +192,53 @@ class Engine:
         self.model.save(path, [c.name for c in self.cfg.classes])
         self.model_dirty = False
         log.info("Saved model to %s", path)
+        if onnx_runtime.available():
+            try:
+                self._export_onnx(self.model_base(path))
+            except Exception as e:
+                log.warning("ONNX export failed (%s); tracking will use PyTorch", e)
+
+    def _export_onnx(self, base):
+        from .onnx_export import export_onnx
+        return export_onnx(self.model, base, [c.name for c in self.cfg.classes])
+
+    def _onnx_up_to_date(self, base):
+        paths = onnx_runtime.onnx_paths(base)
+        if not (os.path.exists(paths["fp32"]) and os.path.exists(paths["meta"])):
+            return False
+        pt = base + ".pt"
+        if os.path.exists(self.cfg.model_path) and self.model_base() == base:
+            pt = self.cfg.model_path
+        return not os.path.exists(pt) or os.path.getmtime(paths["meta"]) >= os.path.getmtime(pt)
+
+    def onnx_model_base(self):
+        """Base path of an ONNX export of the current model, exporting when needed."""
+        if self.model is not None and self.model_dirty:
+            # trained but not saved: export to a temp file, not next to the .pt
+            base = os.path.join(tempfile.gettempdir(), "palbuddy-unsaved-%d" % os.getpid())
+            self._export_onnx(base)
+            return base
+        base = self.model_base()
+        if self._onnx_up_to_date(base):
+            return base
+        if self.model is None:
+            if not os.path.exists(self.cfg.model_path):
+                raise FileNotFoundError("No trained model found (%s). Train and save one first." % self.cfg.model_path)
+            if importlib.util.find_spec("torch") is None:
+                raise RuntimeError("The .onnx export of %s is missing or older than the model, and PyTorch "
+                                   "isn't installed to create it." % self.cfg.model_path)
+            self.load_model()
+        self._export_onnx(base)
+        return base
+
+    def use_onnx(self):
+        choice = self.cfg.infer_engine
+        if choice == "pytorch":
+            return False
+        if choice == "onnx" and not onnx_runtime.available():
+            raise RuntimeError("ONNX Runtime is not installed (pip install onnxruntime, or onnxruntime-directml "
+                               "on Windows)")
+        return onnx_runtime.available()
 
     def ensure_model(self):
         if self.model is None:
@@ -205,6 +276,7 @@ class Engine:
 
     # ------------------------------------------------------------ training
     def train_async(self, on_progress=None, on_done=None, resume=False):
+        from . import trainer  # imports torch
         if self.busy:
             raise RuntimeError("Already %s" % self.busy)
         problems = self.cfg.validate()
@@ -222,11 +294,18 @@ class Engine:
                     init = self.model if self.model is not None else self.load_model()
                     if init.input_mode != self.cfg.input_mode:
                         raise ValueError("The current model was trained for input '%s'" % init.input_mode)
+                    if init.arch != self.cfg.model_arch:
+                        raise ValueError("The current model is a '%s' model; untick 'continue' to train a '%s' one"
+                                         % (init.arch, self.cfg.model_arch))
                 model, history = trainer.train(self.cfg, on_progress=on_progress, stop_event=self._train_stop,
                                                log_fn=log.info, init_model=init, device=self.device)
                 self.model = model
                 self.model_dirty = True
                 ok, message = True, "Training finished (final loss %.6f). Don't forget to save." % history[-1]
+                metrics = getattr(model, "val_metrics", None)
+                if metrics:
+                    message = "Training finished (loss %.6f, validation accuracy %.1f%%). Don't forget to save." % (
+                        history[-1], metrics["val_acc"] * 100)
             except trainer.TrainingCancelled:
                 message = "Training cancelled"
             except Exception as e:
@@ -235,6 +314,7 @@ class Engine:
             finally:
                 self.busy = None
                 if self.device.type == "cuda":
+                    import torch
                     torch.cuda.empty_cache()
             log.info(message)
             if on_done:
@@ -255,11 +335,26 @@ class Engine:
             return
         if self.busy == "training":
             raise RuntimeError("Wait for training to finish")
-        self.ensure_model()
+        runtime = self._make_runtime()  # errors surface here, in the caller
         self._infer_stop.clear()
         self._smoothed = {}
-        self._infer_thread = threading.Thread(target=self._infer_loop, daemon=True, name="inference")
+        self._infer_thread = threading.Thread(target=self._infer_loop, args=(runtime,), daemon=True,
+                                              name="inference")
         self._infer_thread.start()
+
+    def _make_runtime(self):
+        cfg = self.cfg
+        if self.use_onnx():
+            try:
+                return onnx_runtime.OnnxRuntime(self.onnx_model_base(), cfg.infer_device, cfg.infer_threads,
+                                                cfg.infer_int8, expected_mode=cfg.input_mode,
+                                                expected_outputs=cfg.num_classes)
+            except Exception as e:
+                if cfg.infer_engine == "onnx" or importlib.util.find_spec("torch") is None:
+                    raise
+                log.warning("ONNX Runtime unavailable for this model (%s); using PyTorch", e)
+        from .inference import Runtime
+        return Runtime(self.ensure_model(), cfg.infer_device, cfg.infer_threads, cfg.infer_int8)
 
     def stop_inference(self):
         self._infer_stop.set()
@@ -287,12 +382,27 @@ class Engine:
         was_inferring = self.inferring
         self.stop_inference()
         self.busy = "benchmarking"
-        model = self.model if self.model is not None else BuddyNet(max(1, self.cfg.num_classes), self.cfg.input_mode)
+        cfg = self.cfg
 
         def run():
             results, error = [], None
             try:
-                results = benchmark(model, threads=self.cfg.infer_threads)
+                has_torch = importlib.util.find_spec("torch") is not None
+                model = self.model
+                if has_torch:
+                    from .inference import benchmark
+                    from .model import BuddyNet
+                    if model is None:  # speed doesn't depend on the weights
+                        model = BuddyNet(max(1, cfg.num_classes), cfg.input_mode, cfg.model_arch)
+                    results += benchmark(model, threads=cfg.infer_threads)
+                if onnx_runtime.available():
+                    if has_torch:
+                        from .onnx_export import export_onnx
+                        base = os.path.join(tempfile.gettempdir(), "palbuddy-bench-%d" % os.getpid())
+                        export_onnx(model, base)
+                    else:
+                        base = self.onnx_model_base()
+                    results += onnx_runtime.benchmark_onnx(base, threads=cfg.infer_threads)
             except Exception as e:
                 log.exception("benchmark failed")
                 error = str(e)
@@ -308,15 +418,9 @@ class Engine:
 
         threading.Thread(target=run, daemon=True, name="benchmark").start()
 
-    def _infer_loop(self):
+    def _infer_loop(self, runtime):
         cfg = self.cfg
-        try:
-            runtime = Runtime(self.model, cfg.infer_device, cfg.infer_threads, cfg.infer_int8)
-        except Exception:
-            log.exception("could not prepare the model for inference")
-            return
-        old_threads = torch.get_num_threads()
-        runtime.set_threads()
+        runtime.activate()
         runtime.warmup()
         predict = runtime.predict
         self.infer_latency_ms = 0.0
@@ -380,7 +484,7 @@ class Engine:
             if pairs and now - last_send >= min_interval:
                 self.vrcft.send_params(pairs)
                 last_send = now
-        torch.set_num_threads(old_threads)  # process global; don't starve CPU training later
+        runtime.release()
         self.infer_backend = None
         log.info("Inference stopped")
 

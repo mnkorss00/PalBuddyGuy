@@ -71,10 +71,15 @@ class Config:
     learning_rate: float = 5e-5
     mixed_precision: bool = True
     cache_datasets_in_ram: bool = False
+    model_arch: str = "standard"  # "standard" (original network) or "lite" (~8x smaller, faster)
+    validation_split: float = 0.1  # end of each recording held out to measure accuracy; 0 = off
 
     # Inference
     smoothing: float = 0.0  # 0 = off, otherwise EMA factor in (0, 1)
     max_send_rate: float = 120.0  # Hz cap for VRCFT updates
+    # "auto": ONNX Runtime if installed, else PyTorch. ONNX Runtime is faster on the
+    # CPU (int8) and tracking with it never loads PyTorch (~500 MB less RAM).
+    infer_engine: str = "auto"  # "auto", "onnx" or "pytorch"
     infer_device: str = "auto"  # "auto" (GPU if available), "cpu" or "gpu"
     infer_threads: int = 1  # CPU threads for inference; more = lower latency but more total CPU
     infer_int8: bool = True  # int8-quantize the linear layers when inferring on the CPU
@@ -104,6 +109,10 @@ class Config:
 
     def validate(self):
         problems = []
+        if self.model_arch not in ("standard", "lite"):
+            problems.append("model_arch must be 'standard' or 'lite'.")
+        if not 0 <= self.validation_split < 0.5:
+            problems.append("validation_split must be between 0 and 0.5.")
         if self.input_mode not in INPUT_MODES:
             problems.append("input_mode must be one of %s." % ", ".join(INPUT_MODES))
         if not self.classes:

@@ -103,10 +103,15 @@ class Runtime:
             return "CPU %s ×%d" % ("int8" if self.quantized else "fp32", self.threads)
         return "%s fp32" % self.device.type.upper()
 
-    def set_threads(self):
-        """Apply the thread count; call from the inference thread before running."""
+    def activate(self):
+        """Apply the thread count (torch's is process global); call before running."""
+        self._old_threads = torch.get_num_threads()
         if self.device.type == "cpu" and self.threads > 0:
             torch.set_num_threads(self.threads)
+
+    def release(self):
+        """Restore the thread count so later CPU training isn't limited to 1 thread."""
+        torch.set_num_threads(getattr(self, "_old_threads", torch.get_num_threads()))
 
     def warmup(self, runs=3):
         """First calls are slow (allocations, cudnn autotune, quantized kernels);

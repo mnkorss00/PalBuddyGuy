@@ -22,7 +22,8 @@ HELP = """commands:
   infer              start sending tracking to VRCFT (enter 'stop' to end)
   fastcal            calibrate max power by puppeting the avatar
   stop               stop inference / training / recording
-  perf [device auto|cpu|gpu] [threads N] [int8 on|off] [rate HZ]
+  arch [standard|lite]  model size used for the next training
+  perf [engine auto|onnx|pytorch] [device auto|cpu|gpu] [threads N] [int8 on|off] [rate HZ]
                      show / change inference performance settings
   bench              compare CPU fp32 / CPU int8 / GPU on this PC
   stats              frame rate over 5 seconds
@@ -91,7 +92,9 @@ def run_cli(engine):
                 c = engine.cfg
                 words = arg.split()
                 for key, value in zip(words[::2], words[1::2]):
-                    if key == "device" and value in ("auto", "cpu", "gpu"):
+                    if key == "engine" and value in ("auto", "onnx", "pytorch"):
+                        c.infer_engine = value
+                    elif key == "device" and value in ("auto", "cpu", "gpu"):
                         c.infer_device = value
                     elif key == "threads":
                         c.infer_threads = max(1, int(value))
@@ -104,10 +107,17 @@ def run_cli(engine):
                 if words:
                     engine.save_config()
                     engine.restart_inference()
-                print("device %s  threads %d  int8 %s  rate %s  (running: %s)" % (
-                    c.infer_device, c.infer_threads, "on" if c.infer_int8 else "off",
+                print("engine %s  device %s  threads %d  int8 %s  rate %s  (running: %s)" % (
+                    c.infer_engine, c.infer_device, c.infer_threads, "on" if c.infer_int8 else "off",
                     "%.0f Hz" % c.max_infer_rate if c.max_infer_rate else "every frame",
                     engine.infer_backend or "not tracking"))
+            elif cmd == "arch":
+                if arg:
+                    if arg not in ("standard", "lite"):
+                        raise ValueError("arch must be standard or lite")
+                    engine.cfg.model_arch = arg
+                    engine.save_config()
+                print("model arch for training = %s" % engine.cfg.model_arch)
             elif cmd == "bench":
                 done_event.clear()
                 engine.run_benchmark(on_done=lambda r, err: (print(err) if err else None, done_event.set()))

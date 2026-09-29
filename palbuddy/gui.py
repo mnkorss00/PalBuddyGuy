@@ -141,6 +141,7 @@ class App:
 
         self._photo = None
         self.loss_history = []
+        self.last_val = None  # (validation loss, validation accuracy) of the last epoch
         self.bars = {}
 
         self._build_status_bar()
@@ -339,6 +340,11 @@ class App:
         ttk.Checkbutton(opts2, text=t("amp"), variable=self.amp).pack(side="left")
         ttk.Checkbutton(opts2, text=t("cache"), variable=self.cache).pack(side="left", padx=12)
         ttk.Checkbutton(opts2, text=t("resume"), variable=self.resume).pack(side="left")
+        self.arch_labels = {a: t("arch_" + a) for a in ("standard", "lite")}
+        self.arch_var = tk.StringVar(value=self.arch_labels.get(self.cfg.model_arch, self.arch_labels["standard"]))
+        ttk.Label(opts2, text=t("arch")).pack(side="left", padx=(16, 4))
+        ttk.Combobox(opts2, textvariable=self.arch_var, state="readonly", width=24,
+                     values=list(self.arch_labels.values())).pack(side="left")
 
         ctl = ttk.Frame(tab)
         ctl.pack(fill="x")
@@ -421,32 +427,37 @@ class App:
         t = self.t
         c = self.cfg
         box = ttk.LabelFrame(parent, text=t("perf"), padding=8)
+        self.engine_labels = {e: t("eng_" + e) for e in ("auto", "onnx", "pytorch")}
+        self.engine_var = tk.StringVar(value=self.engine_labels.get(c.infer_engine, self.engine_labels["auto"]))
         self.dev_labels = {d: t("dev_" + d) for d in ("auto", "cpu", "gpu")}
         self.dev_var = tk.StringVar(value=self.dev_labels.get(c.infer_device, self.dev_labels["auto"]))
         self.threads_var = tk.IntVar(value=c.infer_threads)
         self.int8_var = tk.BooleanVar(value=c.infer_int8)
         self.rate_var = tk.DoubleVar(value=c.max_infer_rate)
-        ttk.Label(box, text=t("infer_device")).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Combobox(box, textvariable=self.dev_var, state="readonly", width=30,
-                     values=list(self.dev_labels.values())).grid(row=1, column=0, columnspan=2, sticky="w",
-                                                                 pady=(0, 4))
-        ttk.Label(box, text=t("infer_threads")).grid(row=2, column=0, sticky="w", pady=2)
+        row = 0
+        for label, var, labels in (("infer_engine", self.engine_var, self.engine_labels),
+                                   ("infer_device", self.dev_var, self.dev_labels)):
+            ttk.Label(box, text=t(label)).grid(row=row, column=0, columnspan=2, sticky="w")
+            ttk.Combobox(box, textvariable=var, state="readonly", width=30, values=list(labels.values())).grid(
+                row=row + 1, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            row += 2
+        ttk.Label(box, text=t("infer_threads")).grid(row=row, column=0, sticky="w", pady=2)
         ttk.Spinbox(box, from_=1, to=max(1, os.cpu_count() or 1), textvariable=self.threads_var,
-                    width=5).grid(row=2, column=1, sticky="w", padx=(6, 0))
+                    width=5).grid(row=row, column=1, sticky="w", padx=(6, 0))
         ttk.Checkbutton(box, text=t("infer_int8"), variable=self.int8_var).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=2)
-        ttk.Label(box, text=t("max_infer_rate")).grid(row=4, column=0, sticky="w", pady=2)
+            row=row + 1, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(box, text=t("max_infer_rate")).grid(row=row + 2, column=0, sticky="w", pady=2)
         ttk.Spinbox(box, from_=0, to=240, increment=10, textvariable=self.rate_var, width=6).grid(
-            row=4, column=1, sticky="w", padx=(6, 0))
+            row=row + 2, column=1, sticky="w", padx=(6, 0))
         btns = ttk.Frame(box)
-        btns.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        btns.grid(row=row + 3, column=0, columnspan=2, sticky="w", pady=(8, 4))
         ttk.Button(btns, text=t("perf_apply"), command=self.on_apply_perf).pack(side="left")
         self.bench_btn = ttk.Button(btns, text=t("benchmark"), command=self.on_benchmark)
         self.bench_btn.pack(side="left", padx=6)
         ttk.Label(box, text=t("bench_note"), foreground="#666", wraplength=330).grid(
-            row=6, column=0, columnspan=2, sticky="w")
+            row=row + 4, column=0, columnspan=2, sticky="w")
         self.bench_result = ttk.Label(box, text="", font=("TkFixedFont", 9), justify="left")
-        self.bench_result.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.bench_result.grid(row=row + 5, column=0, columnspan=2, sticky="w", pady=(6, 0))
         return box
 
     def _build_log_tab(self):
@@ -492,6 +503,8 @@ class App:
         done = min(info["epoch"], info["epochs"] - 1) * info["steps"] + info["step"]
         if info.get("epoch_done"):
             done = info["epoch"] * info["steps"]
+            if "val_acc" in info:
+                self.last_val = (info["val_loss"], info["val_acc"])
         else:
             self.loss_history.append(info["loss"])
         self.train_progress["value"] = done / max(1, total)
@@ -499,7 +512,8 @@ class App:
         eta = elapsed / max(done, 1) * (total - done)
         self.train_status.configure(text="epoch %d/%d   step %d/%d   loss %.6f   avg %.6f   %.0fs (ETA %.0fs)" % (
             min(info["epoch"] + 1, info["epochs"]), info["epochs"], info["step"], info["steps"],
-            info["loss"], info["avg"], elapsed, eta))
+            info["loss"], info["avg"], elapsed, eta) + (
+            "   " + self.t("val_stats") % (self.last_val[1] * 100, self.last_val[0]) if self.last_val else ""))
         self._draw_loss()
 
     def _ev_train_done(self, ok, message, history):
@@ -541,7 +555,7 @@ class App:
         model = "model ✓" if s["model_loaded"] else "model ✗"
         if s["model_dirty"]:
             model += "*"
-        self.device_label.configure(text="%s: %s   %s" % (t("device"), s["device"], model))
+        self.device_label.configure(text="%s: %s   %s" % (t("device"), s["device"] or "-", model))
 
         if s["inferring"] and not s["infer_backend"]:
             self.infer_btn.configure(text=t("stop_infer"))
@@ -778,6 +792,8 @@ class App:
             self.cfg.learning_rate = float(self.lr.get())
             self.cfg.mixed_precision = bool(self.amp.get())
             self.cfg.cache_datasets_in_ram = bool(self.cache.get())
+            self.cfg.model_arch = next(a for a, text in self.arch_labels.items() if text == self.arch_var.get())
+            self.last_val = None
             self.engine.save_config()
             self.loss_history = []
             self.engine.train_async(
@@ -806,6 +822,7 @@ class App:
             self._error(e)
 
     def _read_perf(self):
+        self.cfg.infer_engine = next(e for e, text in self.engine_labels.items() if text == self.engine_var.get())
         dev = next(d for d, text in self.dev_labels.items() if text == self.dev_var.get())
         threads = max(1, int(self.threads_var.get()))
         rate = max(0.0, float(self.rate_var.get()))

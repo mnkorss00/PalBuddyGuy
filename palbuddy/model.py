@@ -8,7 +8,10 @@ existing buddyguy.pt files load unchanged. Differences:
     whenever the last batch or an inference batch had a different size),
   * runs on CPU when CUDA isn't available,
   * can take only the eye (64 ch) or only the face (64 ch) features, for
-    setups with a single tracker. The checkpoint records which.
+    setups with a single tracker. The checkpoint records which,
+  * an optional "lite" architecture (same layout, fewer channels, ~8x fewer
+    weights, ~5x less compute). Whether it tracks as well as "standard"
+    depends on the data; compare the validation accuracy after training.
 """
 
 import logging
@@ -28,16 +31,22 @@ def pick_device():
     return torch.device("cpu")
 
 
+# arch -> (conv channels, hidden units). "standard" is the original network.
+ARCHS = {"standard": (256, 1024), "lite": (128, 256)}
+
+
 class BuddyNet(nn.Module):
-    def __init__(self, num_outputs, input_mode="both"):
+    def __init__(self, num_outputs, input_mode="both", arch="standard"):
         super().__init__()
         self.num_outputs = num_outputs
         self.input_mode = input_mode
+        self.arch = arch
+        channels, hidden = ARCHS[arch]
         in_channels = 128 if input_mode == "both" else 64
-        self.conv1 = nn.Conv2d(in_channels, 256, 3, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(256, 256, 3, stride=1, padding=1)
-        self.linear1 = nn.Linear(25600, 1024)
-        self.linear2 = nn.Linear(1024, num_outputs)
+        self.conv1 = nn.Conv2d(in_channels, channels, 3, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, stride=1, padding=1)
+        self.linear1 = nn.Linear(channels * 100, hidden)
+        self.linear2 = nn.Linear(hidden, num_outputs)
         self.act = nn.ReLU()
         self.dropout = nn.Dropout(p=0.2)
         self.dropout_in = nn.Dropout(p=0.7)
@@ -55,6 +64,7 @@ class BuddyNet(nn.Module):
         if class_names is not None:
             data["class_names"] = list(class_names)
         data["input_mode"] = self.input_mode
+        data["arch"] = self.arch
         torch.save(data, tmp)
         os.replace(tmp, path)  # never leave a half-written checkpoint behind
 
@@ -73,7 +83,9 @@ class BuddyNet(nn.Module):
             raise ValueError(
                 "Model in %s was trained for input '%s' but input mode '%s' is selected. "
                 "Switch the input mode back or retrain." % (path, mode, expected_mode))
-        model = cls(n, mode)
+        channels = data["conv1"]["weight"].shape[0]
+        arch = data.get("arch") or next((a for a, (c, _) in ARCHS.items() if c == channels), "standard")
+        model = cls(n, mode, arch)
         for name in ("conv1", "conv2", "linear1", "linear2"):
             getattr(model, name).load_state_dict(data[name])
         model.class_names = data.get("class_names")

@@ -94,6 +94,12 @@ echo  나머지 패키지 설치 중... / installing other packages...
 "%PY%" -m pip install -r "%APPDIR%requirements.txt"
 if errorlevel 1 goto fail
 
+rem ONNX Runtime: faster / lighter tracking. The DirectML build also runs on AMD and Intel GPUs.
+rem Optional - if it fails, tracking just uses PyTorch.
+"%PY%" -m pip uninstall -y onnxruntime >nul 2>&1
+"%PY%" -m pip install onnxruntime-directml
+if errorlevel 1 "%PY%" -m pip install onnxruntime
+
 "%PY%" -c "import torch; print(' PyTorch', torch.__version__, '/ CUDA:', torch.cuda.is_available())"
 if errorlevel 1 goto fail
 echo ok> "%VENV%\.installed"

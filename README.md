@@ -73,27 +73,39 @@ Click **Start tracking**. Each output is shown as its raw value and the value se
 **FastCal** puppets each shape on your avatar one after another. Copy it with your face. The measured strengths become each class's *max power*, which you can also edit by hand in the Train tab. **Smoothing** reduces jitter at the cost of a little latency.
 
 ## 5. Inference performance (Settings tab → Inference performance)
-Tracking runs the network on every new frame, about 60 times a second. You can trade GPU, CPU and latency against each other:
+Tracking runs the network on every new frame, about 60 times a second. These settings trade GPU, CPU, memory and latency against each other:
 
 | Setting | What it does |
 |---|---|
-| **Run on** | *auto* uses the GPU if there is one. *CPU* leaves the GPU entirely to VR, and CUDA is never started, which saves its VRAM. *GPU* forces the GPU. |
+| **Engine** | *ONNX Runtime* is the fastest on the CPU and never loads PyTorch while tracking, which saves hundreds of MB of RAM. *auto* uses it when it's installed; the launcher installs it. When you save a model, an `.onnx` copy (plus an int8 version) is written next to the `.pt`, and it is refreshed automatically if the `.pt` is newer. |
+| **Run on** | *auto* uses the GPU if there is one. With ONNX Runtime that means DirectML (`onnxruntime-directml`), which works on NVIDIA, **AMD** and Intel GPUs. *CPU* leaves the GPU entirely to VR. *GPU* forces the GPU. |
 | **CPU threads** | Default 1. More threads cut latency but **increase** total CPU use. |
-| **int8 quantization** | On the CPU, stores the big linear layer as int8: about 2× faster and 4× less memory traffic, with the same model and no retraining. The output difference is about 0.003. |
+| **int8 quantization** | On the CPU, uses int8 weights for the big linear layer: about 2–3× faster, with the same model and no retraining. The output difference is about 0.003. |
 | **Max tracking rate** | For example 30 Hz. Skips frames in between and halves the work. Combine it with *Smoothing* on the Live tab. |
 
-**Benchmark this PC** times CPU fp32, CPU int8 and GPU with your model, so you can pick what works best on your machine. The Live tab shows the running backend, the time per frame and the whole process's CPU use.
+**Benchmark this PC** times every available backend with your model, so you can pick what works best on your machine. The Live tab shows the running backend, the time per frame and the whole process's CPU use.
 
-Measured on one 2.8 GHz Xeon core with frames arriving at 60 Hz (whole-process CPU, % of one core):
+### Lite model (Train tab → Model)
+*lite* has the same layout with fewer channels: about 8× fewer weights and about 5× less compute. Whether it tracks as well as *standard* depends on your recordings. To compare them, train both and look at the **validation accuracy**.
 
-| Backend | ms/frame | CPU |
-|---|---|---|
-| fp32, 4 threads (old default: all cores) | 8.0 | 105 % |
-| fp32, 1 thread | 12.7 | 76 % |
-| **int8, 1 thread** (new CPU default) | 7.1 | 47 % |
-| int8, 1 thread, max 30 Hz | 7.5 | 23 % |
+### Validation accuracy
+Training holds out the last 10 % of every recording (`validation_split` in `config.json`) and reports validation loss and accuracy after each epoch, plus the worst classes at the end. The hold-out is taken from the end of each recording rather than as random frames, because neighbouring frames are nearly identical and a random split would overstate accuracy.
 
-Idle OpenMP threads are also told not to busy-wait (`OMP_WAIT_POLICY=PASSIVE`), so they don't burn CPU between frames.
+### Measurements
+One 2.8 GHz Xeon core, frames arriving at 60 Hz, whole-process CPU as % of one core, memory measured while tracking:
+
+| Model | Backend | ms/frame | CPU | RAM |
+|---|---|---|---|---|
+| standard | PyTorch fp32, all cores (old default) | 8.0 | 105 % | |
+| standard | PyTorch int8, 1 thread | 7.6 | 50 % | 761 MB |
+| standard | **ONNX int8, 1 thread** | 5.3 | 31 % | **102 MB** |
+| lite | PyTorch fp32, 1 thread | 3.4 | 22 % | 576 MB |
+| lite | **ONNX int8, 1 thread** | 1.4 | **11 %** | **72 MB** |
+
+Idle worker threads are also told not to busy-wait (`OMP_WAIT_POLICY=PASSIVE`, and ONNX Runtime spinning is off), so they don't burn CPU between frames.
+
+### Tracking on a PC without PyTorch
+Copy `config.json`, `buddyguy.onnx`, `buddyguy.int8.onnx` and `buddyguy.json` next to the app, then `pip install numpy onnxruntime`. Tracking works without PyTorch; only training needs it.
 
 # What changed compared to the original scripts
 **GUI**
@@ -134,5 +146,7 @@ If you want the receiver in its own process, run `python tvm_proxy.py` and set t
 5. **녹화** 탭: 이름을 입력하고 녹화합니다 (약 30초, 파일 하나에 약 400MB). `neutral`(무표정) 녹화는 반드시 있어야 합니다.
 6. **학습** 탭: 클래스별로 녹화 파일과 대상 파라미터를 지정합니다 (첫 번째 클래스는 neutral). *학습 시작*을 누르고, 손실이 0.001 아래로 내려가면 *모델 저장*을 누릅니다.
 7. **실시간** 탭: *트래킹 시작*을 누른 뒤 *빠른 보정(FastCal)*으로 아바타를 따라 하며 보정합니다.
+
+8. **설정 탭 → 추론 성능**: 기본값(자동: ONNX Runtime, CPU int8)으로도 가볍게 돌아갑니다. *이 PC에서 비교 측정*을 누르면 CPU/GPU/ONNX 중 어느 쪽이 이 PC에 맞는지 바로 확인할 수 있습니다. 학습 탭에서 *모델 크기 → 경량*을 고르면 추론이 약 5배 빨라집니다. 표준 모델과 검증 정확도를 비교해 보고 결정하세요.
 
 언어는 설정 탭에서 바꿀 수 있습니다 (auto / en / ko).

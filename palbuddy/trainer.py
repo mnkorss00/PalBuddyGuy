@@ -69,6 +69,56 @@ def check_recording(rec, channels, path):
                              "tracker), so it can't be used in this input mode." % (path, name))
 
 
+VAL_FRAMES_PER_FILE = 32
+
+
+def split_recordings(recordings, fraction, channels):
+    """Hold out the *end* of every recording for validation.
+
+    Neighbouring frames are nearly identical, so a random split would leak;
+    a contiguous tail measures how well the model handles moments it hasn't
+    seen. Returns (train recordings, val_x, val_class) - val arrays may be empty."""
+    if fraction <= 0:
+        return recordings, None, None
+    train, xs, ys = [], [], []
+    for c, recs in enumerate(recordings):
+        kept = []
+        for rec in recs:
+            n_train = int(len(rec) * (1 - fraction))
+            if n_train < 16 or len(rec) - n_train < 4:
+                kept.append(rec)  # too short to split
+                continue
+            kept.append(rec[:n_train])
+            idx = np.linspace(n_train, len(rec) - 1, num=min(VAL_FRAMES_PER_FILE, len(rec) - n_train)).astype(int)
+            xs.append(np.ascontiguousarray(rec[idx, channels]))
+            ys.append(np.full(len(idx), c))
+        train.append(kept)
+    if not xs:
+        return train, None, None
+    return train, np.concatenate(xs), np.concatenate(ys)
+
+
+@torch.no_grad()
+def evaluate(model, val_x, val_y, num_classes, device, batch=256):
+    """-> (mse loss, accuracy, per-class accuracy list) on the held-out frames."""
+    was_training = model.training
+    model.eval()
+    eye = torch.eye(num_classes, device=device)
+    loss_sum, correct = 0.0, np.zeros(num_classes)
+    counts = np.bincount(val_y, minlength=num_classes).astype(float)
+    for i in range(0, len(val_x), batch):
+        x = torch.from_numpy(val_x[i:i + batch]).to(device)
+        y = torch.from_numpy(val_y[i:i + batch]).to(device)
+        pred = model(x).float()
+        loss_sum += float(((pred - eye[y]) ** 2).mean(dim=1).sum())
+        hit = (pred.argmax(dim=1) == y).cpu().numpy()
+        np.add.at(correct, val_y[i:i + batch], hit)
+    if was_training:
+        model.train()
+    per_class = [float(c / n) if n else float("nan") for c, n in zip(correct, counts)]
+    return loss_sum / len(val_x), float(correct.sum() / counts.sum()), per_class
+
+
 def load_recordings(cfg, log_fn=print):
     channels = channels_for(cfg.input_mode)
     recordings = []
@@ -98,7 +148,11 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
     on_progress = on_progress or (lambda **kw: None)
 
     recordings, total_frames = load_recordings(cfg, log_fn)
-    model = init_model if init_model is not None else BuddyNet(cfg.num_classes, cfg.input_mode)
+    channels = channels_for(cfg.input_mode)
+    recordings, val_x, val_y = split_recordings(recordings, cfg.validation_split, channels)
+    if val_x is not None:
+        log_fn("Holding out %d frames (end of each recording) for validation" % len(val_x))
+    model = init_model if init_model is not None else BuddyNet(cfg.num_classes, cfg.input_mode, cfg.model_arch)
     if model.num_outputs != cfg.num_classes:
         raise ValueError("Model output count does not match the class list")
     if model.input_mode != cfg.input_mode:
@@ -117,7 +171,7 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
 
     # one "epoch" = as many samples as the original: 2048 frames per class
     steps = max(1, (2048 * cfg.num_classes) // cfg.batch_size)
-    sampler = BatchSampler(recordings, cfg.batch_size, channels=channels_for(cfg.input_mode))
+    sampler = BatchSampler(recordings, cfg.batch_size, channels=channels)
     q = queue.Queue(maxsize=6)
     producer_stop = threading.Event()
 
@@ -169,12 +223,25 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
                                 avg=running / (step + 1), elapsed=time.monotonic() - start)
             avg = running / steps
             history.append(avg)
-            log_fn("Epoch %d/%d  avg loss %.6f" % (epoch + 1, cfg.epochs, avg))
+            val = {}
+            if val_x is not None:
+                vloss, vacc, per_class = evaluate(model, val_x, val_y, cfg.num_classes, device)
+                val = {"val_loss": vloss, "val_acc": vacc}
+                model.val_metrics = dict(val, per_class=dict(zip((c.name for c in cfg.classes), per_class)))
+                log_fn("Epoch %d/%d  avg loss %.6f  val loss %.6f  val accuracy %.1f%%" % (
+                    epoch + 1, cfg.epochs, avg, vloss, vacc * 100))
+            else:
+                log_fn("Epoch %d/%d  avg loss %.6f" % (epoch + 1, cfg.epochs, avg))
             on_progress(epoch=epoch + 1, epochs=cfg.epochs, step=steps, steps=steps, loss=avg, avg=avg,
-                        elapsed=time.monotonic() - start, epoch_done=True)
+                        elapsed=time.monotonic() - start, epoch_done=True, **val)
     finally:
         producer_stop.set()
     model.eval()
+    metrics = getattr(model, "val_metrics", None)
+    if metrics:
+        worst = sorted(metrics["per_class"].items(), key=lambda kv: kv[1])[:3]
+        log_fn("Validation accuracy per class (worst first): %s" % ", ".join(
+            "%s %.0f%%" % (name, acc * 100) for name, acc in worst))
     if history and history[-1] > 0.001:
         log_fn("Warning: final loss %.6f is above 0.001 - check your recordings / class list" % history[-1])
     return model, history

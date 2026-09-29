@@ -352,7 +352,8 @@ class SingleTrackerTests(unittest.TestCase):
                 mm[:, :64] = 0  # recorded with the facial tracker only
             mm.flush()
             del mm
-        cfg = Config(dataset_folder=tmp.name, face_port=0, eye_port=0, vrcft_port=0, epochs=1, batch_size=64,
+        cfg = Config(dataset_folder=tmp.name, model_path=os.path.join(tmp.name, "m.pt"),
+                     face_port=0, eye_port=0, vrcft_port=0, epochs=1, batch_size=64, validation_split=0,
                      mixed_precision=False, input_mode="face",
                      classes=[ExpressionClass("neutral", ["n.mmap"]),
                               ExpressionClass("smile", ["s.mmap", "faceonly.mmap"], "JawOpen")])
@@ -429,6 +430,7 @@ class InferencePerfTests(unittest.TestCase):
 
     def test_rate_cap_and_thread_restore(self):
         cfg = Config(face_port=0, eye_port=0, vrcft_port=0, input_mode="face", max_infer_rate=10,
+                     infer_engine="pytorch",
                      infer_device="cpu", infer_threads=1, classes=[ExpressionClass("n"), ExpressionClass("s")])
         engine = Engine(cfg).start()
         self.addCleanup(engine.stop)
@@ -453,7 +455,10 @@ class InferencePerfTests(unittest.TestCase):
         self.assertIsNone(engine.infer_backend)
 
     def test_benchmark_via_engine_resumes_tracking(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
         cfg = Config(face_port=0, eye_port=0, vrcft_port=0, infer_device="cpu",
+                     model_path=os.path.join(tmp.name, "m.pt"),
                      classes=[ExpressionClass("n"), ExpressionClass("s")])
         engine = Engine(cfg).start()
         self.addCleanup(engine.stop)
@@ -466,6 +471,161 @@ class InferencePerfTests(unittest.TestCase):
         self.assertIsNone(out["e"])
         self.assertTrue(wait_for(lambda: engine.inferring))
         self.assertIsNone(engine.busy)
+
+
+def make_recordings(folder, spec, frames=32, seed=0):
+    """spec: {name: offset}. Separable synthetic recordings."""
+    rng = np.random.default_rng(seed)
+    for name, offset in spec.items():
+        mm = np.memmap(os.path.join(folder, name + ".mmap"), np.float32, "w+", shape=(frames, 128, 20, 20))
+        mm[:] = rng.normal(offset, 0.1, size=mm.shape)
+        mm.flush()
+        del mm
+
+
+class LiteAndValidationTests(unittest.TestCase):
+    def test_lite_model(self):
+        std, lite = BuddyNet(4), BuddyNet(4, arch="lite")
+        n = lambda m: sum(p.numel() for p in m.parameters())
+        self.assertLess(n(lite) * 6, n(std))
+        self.assertEqual(tuple(lite.eval()(torch.randn(2, 128, 20, 20)).shape), (2, 4))
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.pt")
+            lite.save(path)
+            self.assertEqual(BuddyNet.load(path).arch, "lite")
+            # checkpoint without an "arch" key: detected from the layer shapes
+            torch.save({k: getattr(lite, k).state_dict() for k in ("conv1", "conv2", "linear1", "linear2")}, path)
+            self.assertEqual(BuddyNet.load(path).arch, "lite")
+
+    def test_split_holds_out_the_tail(self):
+        from palbuddy.trainer import split_recordings
+        rec = np.arange(100, dtype=np.float32)[:, None, None, None] * np.ones((1, 128, 20, 20), np.float32)
+        train_recs, vx, vy = split_recordings([[rec], [rec]], 0.1, slice(0, 128))
+        self.assertEqual(len(train_recs[0][0]), 90)
+        self.assertTrue((vx[:, 0, 0, 0] >= 90).all())  # only frames the model never trains on
+        self.assertEqual(sorted(set(vy.tolist())), [0, 1])
+        self.assertIsNone(split_recordings([[rec]], 0, slice(0, 128))[1])
+
+    def test_train_lite_with_validation(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        make_recordings(tmp.name, {"n": 0.0, "s": 1.0}, frames=64)
+        cfg = Config(dataset_folder=tmp.name, epochs=3, batch_size=32, mixed_precision=False, model_arch="lite",
+                     validation_split=0.2, classes=[ExpressionClass("neutral", ["n.mmap"]),
+                                                    ExpressionClass("smile", ["s.mmap"], "JawOpen")])
+        seen = []
+        model, _ = train(cfg, log_fn=lambda *a: None, device=torch.device("cpu"),
+                         on_progress=lambda **i: seen.append(i) if i.get("epoch_done") else None)
+        self.assertEqual(model.arch, "lite")
+        self.assertIn("val_acc", seen[-1])
+        self.assertGreater(model.val_metrics["val_acc"], 0.9)  # trivially separable data
+        self.assertEqual(set(model.val_metrics["per_class"]), {"neutral", "smile"})
+
+
+@unittest.skipUnless(__import__("importlib").util.find_spec("onnxruntime"), "onnxruntime not installed")
+class OnnxTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_export_and_runtime_match_torch(self):
+        from palbuddy.onnx_export import export_onnx
+        from palbuddy.onnx_runtime import OnnxRuntime
+        for arch, mode in (("standard", "both"), ("lite", "face")):
+            m = BuddyNet(3, mode, arch).eval()
+            base = os.path.join(self.tmp.name, arch)
+            paths = export_onnx(m, base, ["a", "b", "c"])
+            self.assertTrue(os.path.exists(paths["fp32"]))
+            ch = 128 if mode == "both" else 64
+            x = np.random.default_rng(1).random((1, ch, 20, 20), dtype=np.float32)
+            with torch.no_grad():
+                ref = m(torch.from_numpy(x))[0].numpy()
+            fp32 = OnnxRuntime(base, "cpu", 1, int8=False, expected_mode=mode, expected_outputs=3)
+            np.testing.assert_allclose(fp32.predict_array(x), ref, atol=1e-4)
+            self.assertIn("fp32", fp32.describe())
+            if os.path.exists(paths["int8"]):
+                q = OnnxRuntime(base, "cpu", 1, int8=True)
+                self.assertTrue(q.quantized)
+                self.assertLess(np.abs(q.predict_array(x) - ref).max(), 0.05)
+            with self.assertRaises(ValueError):
+                OnnxRuntime(base, "cpu", expected_outputs=4)
+
+    def test_engine_tracks_with_onnx_and_reexports_stale(self):
+        make_recordings(self.tmp.name, {"n": 0.0, "s": 1.0})
+        model_path = os.path.join(self.tmp.name, "m.pt")
+        cfg = Config(dataset_folder=self.tmp.name, model_path=model_path, face_port=0, eye_port=0, vrcft_port=0,
+                     infer_engine="onnx", infer_device="cpu",
+                     classes=[ExpressionClass("neutral", ["n.mmap"]), ExpressionClass("smile", ["s.mmap"], "JawOpen")])
+        engine = Engine(cfg)
+        engine.device = torch.device("cpu")
+        engine.start()
+        self.addCleanup(engine.stop)
+
+        engine.model, engine.model_dirty = BuddyNet(2), True
+        engine.start_inference()  # unsaved model -> temporary export
+        self.assertTrue(wait_for(lambda: engine.infer_backend is not None))
+        self.assertTrue(engine.infer_backend.startswith("ONNX CPU"))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "m.onnx")))
+        engine.stop_inference()
+
+        engine.save_model()  # saving also exports next to the .pt
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "m.onnx")))
+        meta = os.path.join(self.tmp.name, "m.json")
+        os.utime(meta, (time.time() - 100, time.time() - 100))  # .pt now newer than the export
+        engine.model = None
+        vr = socket.create_connection(("127.0.0.1", engine.vrcft.port))
+        self.addCleanup(vr.close)
+        self.assertTrue(wait_for(lambda: engine.vrcft.connected))
+        engine.start_inference()
+        self.assertGreater(os.path.getmtime(meta), time.time() - 50)  # re-exported
+        engine.hub.push(neural(1.0), neural(1.0))
+        vr.settimeout(3)
+        self.assertEqual(recv_exact(vr, 5)[:3], bytearray([2, 1, 3]))
+
+    def test_tracking_without_pytorch(self):
+        """A process that can't import torch still tracks from the exported .onnx files."""
+        from palbuddy.onnx_export import export_onnx
+        base = os.path.join(self.tmp.name, "m")
+        export_onnx(BuddyNet(2, "face"), base)
+        code = r"""
+import sys, time, json
+sys.modules["torch"] = None  # any torch import now fails
+sys.path.insert(0, %r)
+import numpy as np
+from palbuddy.config import Config, ExpressionClass
+from palbuddy.engine import Engine
+cfg = Config(model_path=%r, face_port=0, eye_port=0, vrcft_port=0, input_mode="face", infer_device="cpu",
+             classes=[ExpressionClass("n"), ExpressionClass("s", target="JawOpen")])
+e = Engine(cfg).start()
+e.start_inference()
+for _ in range(100):
+    e.hub.push(None, np.full(25600, 0.5, np.float32).tobytes())
+    time.sleep(0.01)
+    if e.last_raw is not None:
+        break
+print(json.dumps({"backend": e.infer_backend, "raw": None if e.last_raw is None else len(e.last_raw)}))
+e.stop()
+""" % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))), base + ".pt")
+        import json
+        import subprocess
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        result = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertTrue(result["backend"].startswith("ONNX"))
+        self.assertEqual(result["raw"], 2)
+
+    def test_benchmark_includes_onnx(self):
+        cfg = Config(face_port=0, eye_port=0, vrcft_port=0, infer_device="cpu", model_arch="lite",
+                     model_path=os.path.join(self.tmp.name, "m.pt"),
+                     classes=[ExpressionClass("n"), ExpressionClass("s")])
+        engine = Engine(cfg).start()
+        self.addCleanup(engine.stop)
+        done = threading.Event()
+        out = {}
+        engine.run_benchmark(on_done=lambda r, e: (out.update(r=r, e=e), done.set()))
+        self.assertTrue(done.wait(120))
+        self.assertIsNone(out["e"])
+        self.assertTrue(any(r["backend"].startswith("ONNX") for r in out["r"]))
 
 
 class ConfigTests(unittest.TestCase):
