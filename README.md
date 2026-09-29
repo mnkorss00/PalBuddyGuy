@@ -7,7 +7,7 @@ It now comes with a GUI, and one process handles receiving data, recording, trai
 
 # System requirements
 * An NVIDIA GPU with CUDA and at least 4 GB of VRAM is recommended. The code also runs on CPU (and Apple MPS), but training will be slow.
-* The example setup uses both the eye tracker and the face tracker.
+* Works with **both trackers, the facial tracker only, or the Pro Eye only**. See *Input mode* below.
 * Python 3.8+ with PyTorch.
 
 # Installation
@@ -42,6 +42,20 @@ All settings are saved in `config.json`, which is created on first start. You ca
 ## 1. Check the streams (Live tab)
 The status bar shows whether the eye tracker, face tracker and VRCFaceTracking are connected, and their frame rates.
 The camera preview should show the **eyes on top and the face below**. If they're reversed, click **Swap eye/face**. The choice is saved.
+
+### Input mode
+The **Input** box on the Live tab selects which trackers feed the network:
+
+| Input | Uses |
+|---|---|
+| Eye + face trackers | both feature maps (the original behaviour) |
+| Face tracker only | only the facial tracker's features |
+| Eye tracker only | only the Pro Eye's features |
+
+* If the connected trackers don't match the selected mode, a suggestion appears. When only one tracker streams, check the preview and click *Face only* or *Eye only*. With a single tracker, it doesn't matter which SRanipal port its stream arrives on, so no swapping is needed.
+* A model only works in the input mode it was trained in, and the mode is stored in the model file. After switching, train again.
+* Recordings always store both halves, with a missing tracker saved as zeros. That means **recordings made with both trackers can be reused** for face-only or eye-only training. A recording made with one tracker can't be used for a mode that needs the other tracker, and training tells you which file is the problem.
+* In every mode the outputs drive VRCFT *lip* shapes, because that's what the VRCFT module accepts. Normal eye tracking (gaze, blink) keeps working as before. In eye-only mode you can still train something like a frown seen by the eye cameras and map it to a lip shape.
 
 ## 2. Record (Record tab)
 Enter a name and click **Record**. After the countdown, 2048 frames are captured (about 30 s) and written directly to `<dataset folder>/<name>-em.mmap`.
@@ -93,7 +107,7 @@ If you want the receiver in its own process, run `python tvm_proxy.py` and set t
 1. `tvm runtime` 폴더의 DLL 두 개를 `C:\Program Files\VIVE\SRanipal`에 덮어씁니다 (원본은 백업해 두세요).
 2. **`PalBuddyGuy.bat`을 더블클릭합니다.** 처음 실행할 때는 Python(없으면 winget으로 설치할지 묻습니다), PyTorch(NVIDIA GPU가 있으면 CUDA 버전)와 나머지 패키지를 `.venv` 폴더에 자동으로 설치하고, 바탕화면 바로가기를 만들지 묻습니다. 다운로드가 약 2~3GB라 몇 분 걸립니다. 그다음부터는 더블클릭하면 콘솔 창 없이 바로 GUI가 뜹니다. 다시 설치하려면 `.venv` 폴더를 지우고 다시 실행하세요.
 3. **SRanipalRuntime보다 먼저** 실행해야 합니다. 이제 `tvm_proxy.py`는 따로 실행할 필요가 없습니다.
-4. **실시간** 탭: 위에 눈, 아래에 얼굴이 보이는지 확인합니다. 반대로 보이면 *눈/얼굴 뒤바꾸기*를 누르세요.
+4. **실시간** 탭: *입력 방식*을 고릅니다. **눈+입 / 입만(페이셜 트래커) / 눈만(Pro Eye)** 중 하나입니다. 트래커가 하나만 연결되어 있으면 미리보기를 보고 *입만* 또는 *눈만*을 누르면 됩니다. 두 트래커를 모두 쓸 때는 위에 눈, 아래에 얼굴이 보이는지 확인하고, 반대로 보이면 *눈/얼굴 뒤바꾸기*를 누르세요. 입력 방식을 바꾸면 다시 학습해야 합니다. 눈+입으로 녹화한 파일은 입만/눈만 학습에도 그대로 쓸 수 있습니다.
 5. **녹화** 탭: 이름을 입력하고 녹화합니다 (약 30초, 파일 하나에 약 400MB). `neutral`(무표정) 녹화는 반드시 있어야 합니다.
 6. **학습** 탭: 클래스별로 녹화 파일과 대상 파라미터를 지정합니다 (첫 번째 클래스는 neutral). *학습 시작*을 누르고, 손실이 0.001 아래로 내려가면 *모델 저장*을 누릅니다.
 7. **실시간** 탭: *트래킹 시작*을 누른 뒤 *빠른 보정(FastCal)*으로 아바타를 따라 하며 보정합니다.

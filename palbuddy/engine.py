@@ -55,7 +55,8 @@ class Engine:
             self.source = ProxyClient(self.hub, cfg.bind_host, cfg.proxy_port).start()
         else:
             self.source = SRanipalReceiver(self.hub, cfg.bind_host, cfg.face_port, cfg.eye_port,
-                                           swapped=cfg.swapped).start()
+                                           swapped=cfg.swapped, mode=cfg.input_mode,
+                                           stall_timeout=cfg.stall_timeout).start()
         self.vrcft = VRCFTServer(cfg.bind_host, cfg.vrcft_port).start()
         log.info("Compute device: %s", self.device)
         return self
@@ -74,9 +75,27 @@ class Engine:
             self.cfg.save(self.config_path)
 
     # ------------------------------------------------------------ status
+    def mode_hint(self, streams):
+        """Suggest an input mode when the connected trackers don't match the selected one.
+
+        Returns "both", "single" (only one tracker streams; which one can't be told
+        from the port, so the user picks face/eye using the camera preview) or None."""
+        mode = self.cfg.input_mode
+        ok = {role: streams.get(role, {}).get("state") == "ok" for role in ("eye", "face")}
+        if not any(ok.values()) or self.cfg.source == "proxy":
+            return None
+        if mode == "both" and not all(ok.values()):
+            return "single"
+        if mode != "both" and all(ok.values()):
+            return "both"
+        return None
+
     def status(self):
+        streams = self.source.snapshot(self.cfg.stall_timeout) if self.source else {}
         return {
-            "streams": self.source.snapshot(self.cfg.stall_timeout) if self.source else {},
+            "streams": streams,
+            "input_mode": self.cfg.input_mode,
+            "mode_hint": self.mode_hint(streams),
             "sample_fps": self.hub.sample_rate.rate(),
             "vrcft": self.vrcft.snapshot() if self.vrcft else {"connected": False},
             "inferring": self.inferring,
@@ -90,6 +109,23 @@ class Engine:
             "swapped": self.cfg.swapped,
         }
 
+    def set_input_mode(self, mode):
+        if mode == self.cfg.input_mode:
+            return
+        if self.busy:
+            raise RuntimeError("Wait until %s has finished" % self.busy)
+        self.stop_inference()
+        self.cfg.input_mode = mode
+        if self.source:
+            self.source.set_mode(mode)
+        if self.model is not None and self.model.input_mode != mode:
+            log.info("Unloaded the model: it was trained for input '%s'. Load or train a '%s' model.",
+                     self.model.input_mode, mode)
+            self.model = None
+            self.model_dirty = False
+        self.save_config()
+        log.info("Input mode: %s", mode)
+
     def set_swapped(self, value):
         self.cfg.swapped = bool(value)
         if self.source:
@@ -102,7 +138,8 @@ class Engine:
 
     def load_model(self, path=None):
         path = path or self.cfg.model_path
-        self.model = BuddyNet.load(path, self.device, expected_outputs=self.cfg.num_classes).eval()
+        self.model = BuddyNet.load(path, self.device, expected_outputs=self.cfg.num_classes,
+                                   expected_mode=self.cfg.input_mode).eval()
         self.model_dirty = False
         log.info("Loaded model %s", path)
         return self.model
@@ -166,6 +203,8 @@ class Engine:
                 init = None
                 if resume:
                     init = self.model if self.model is not None else self.load_model()
+                    if init.input_mode != self.cfg.input_mode:
+                        raise ValueError("The current model was trained for input '%s'" % init.input_mode)
                 model, history = trainer.train(self.cfg, on_progress=on_progress, stop_event=self._train_stop,
                                                log_fn=log.info, init_model=init, device=self.device)
                 self.model = model
@@ -221,14 +260,22 @@ class Engine:
         model = self.model.eval()
         device = self.device
         pin = device.type == "cuda"
-        host = torch.empty((1, 128, 20, 20), dtype=torch.float32, pin_memory=pin)
+        mode = model.input_mode
+        host = torch.empty((1, 128 if mode == "both" else 64, 20, 20), dtype=torch.float32, pin_memory=pin)
         host_np = host.numpy()
+        # where each tracker's features go in the input tensor (None = not used)
+        eye_at = 0 if mode in ("both", "eye") else None
+        face_at = 64 if mode == "both" else (0 if mode == "face" else None)
 
         @torch.inference_mode()
         def predict(sample):
             eye, face = sample
-            host_np[0, :64] = np.frombuffer(eye, dtype=np.float32).reshape(64, 20, 20)
-            host_np[0, 64:] = np.frombuffer(face, dtype=np.float32).reshape(64, 20, 20)
+            for data, at in ((eye, eye_at), (face, face_at)):
+                if at is None:
+                    continue
+                if data is None:  # a needed tracker is missing from this sample
+                    return None
+                host_np[0, at:at + 64] = np.frombuffer(data, dtype=np.float32).reshape(64, 20, 20)
             return model(host.to(device, non_blocking=pin))[0].float().cpu().numpy()
 
         return predict
@@ -260,6 +307,8 @@ class Engine:
             waiting_logged = False
             t0 = time.perf_counter()
             raw = predict(sample)
+            if raw is None:
+                continue
             self.infer_latency_ms = (time.perf_counter() - t0) * 1000
             self.infer_rate.tick()
             self.last_raw = raw
@@ -315,8 +364,9 @@ class Engine:
             end = time.monotonic() + 1.0
             while time.monotonic() < end and not stopped():
                 seq, sample = self.hub.wait_next(seq, timeout=0.2)
-                if sample is not None:
-                    total += float(predict(sample)[idx])
+                raw = predict(sample) if sample is not None else None
+                if raw is not None:
+                    total += float(raw[idx])
                     count += 1
             results[idx] = (total / count if count else 0.0) + 1e-9
             for i in range(101):  # ease out

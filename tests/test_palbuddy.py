@@ -251,6 +251,151 @@ class PipelineTests(unittest.TestCase):
             engine.stop()
 
 
+class SingleTrackerTests(unittest.TestCase):
+    """Face-only and eye-only setups."""
+
+    def make_rx(self, mode, swapped=False):
+        hub = FrameHub()
+        rx = SRanipalReceiver(hub, "127.0.0.1", 0, 0, swapped=swapped, mode=mode).start()
+        self.addCleanup(rx.stop)
+        return hub, rx
+
+    def connect(self, rx, index):
+        s = socket.create_connection(("127.0.0.1", rx.ports[index]))
+        self.addCleanup(s.close)
+        return s
+
+    def test_face_only_on_either_port(self):
+        # the single stream lands on the port that is "eye" by default: no swap needed
+        hub, rx = self.make_rx("face")
+        s = self.connect(rx, 1)
+        s.sendall(packet(neural(2.0)))
+        _, sample = hub.wait_next(0, timeout=2)
+        self.assertIsNone(sample[0])
+        self.assertEqual(np.frombuffer(sample[1], np.float32)[0], 2.0)
+        self.assertEqual(rx.snapshot()["face"]["state"], "ok")
+
+    def test_eye_only_on_either_port(self):
+        hub, rx = self.make_rx("eye")
+        s = self.connect(rx, 0)
+        s.sendall(packet(neural(3.0)))
+        _, sample = hub.wait_next(0, timeout=2)
+        self.assertEqual(np.frombuffer(sample[0], np.float32)[0], 3.0)
+        self.assertIsNone(sample[1])
+
+    def test_face_mode_with_both_trackers_ignores_eye(self):
+        hub, rx = self.make_rx("face")
+        face, eye = self.connect(rx, 0), self.connect(rx, 1)
+        face.sendall(packet(neural(1.0)))
+        eye.sendall(packet(neural(9.0)))
+        seq, sample = hub.wait_next(0, timeout=2)
+        time.sleep(0.2)
+        for _ in range(3):
+            eye.sendall(packet(neural(9.0)))
+        face.sendall(packet(neural(4.0)))
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            seq, sample = hub.wait_next(seq, timeout=0.5)
+            if sample is None:
+                continue
+            self.assertIsNone(sample[0])
+            self.assertNotEqual(np.frombuffer(sample[1], np.float32)[0], 9.0)
+            if np.frombuffer(sample[1], np.float32)[0] == 4.0:
+                break
+        else:
+            self.fail("face sample not received")
+
+    def test_stalled_face_never_takes_eye_data(self):
+        hub, rx = self.make_rx("face")
+        face, eye = self.connect(rx, 0), self.connect(rx, 1)
+        face.sendall(packet(neural(1.0)))
+        seq, _ = hub.wait_next(0, timeout=2)
+        rx.status["port0"].last_frame -= 10  # face tracker stalled for a long time
+        eye.sendall(packet(neural(9.0)) * 5)
+        seq2, sample = hub.wait_next(seq, timeout=0.5)
+        self.assertIsNone(sample)
+
+    def test_proxy_zero_fills_missing_tracker(self):
+        src = FrameHub()
+        server = ProxyServer(src, "127.0.0.1", 0).start()
+        self.addCleanup(server.stop)
+        c = socket.create_connection(("127.0.0.1", server.port))
+        self.addCleanup(c.close)
+        self.assertTrue(wait_for(lambda: server.clients == 1))
+        src.push(None, neural(5.0))
+        data = np.frombuffer(bytes(recv_exact(c, 2 * 102400)), np.float32)
+        self.assertEqual(data[0], 0.0)
+        self.assertEqual(data[25600], 5.0)
+
+    def test_model_mode_in_checkpoint(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.pt")
+            m = BuddyNet(2, "face")
+            self.assertEqual(m(torch.randn(1, 64, 20, 20)).shape[1], 2)
+            m.save(path)
+            self.assertEqual(BuddyNet.load(path, expected_mode="face").input_mode, "face")
+            with self.assertRaises(ValueError):
+                BuddyNet.load(path, expected_mode="both")
+            legacy = os.path.join(d, "legacy.pt")
+            b = BuddyNet(2)
+            torch.save({k: getattr(b, k).state_dict() for k in ("conv1", "conv2", "linear1", "linear2")}, legacy)
+            self.assertEqual(BuddyNet.load(legacy).input_mode, "both")
+
+    def test_train_and_infer_face_only(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rng = np.random.default_rng(1)
+        for name, offset, eye in (("n", 0.0, True), ("s", 1.0, True), ("faceonly", 1.0, False)):
+            mm = np.memmap(os.path.join(tmp.name, name + ".mmap"), np.float32, "w+", shape=(16, 128, 20, 20))
+            mm[:] = rng.normal(offset, 0.1, size=mm.shape)
+            if not eye:
+                mm[:, :64] = 0  # recorded with the facial tracker only
+            mm.flush()
+            del mm
+        cfg = Config(dataset_folder=tmp.name, face_port=0, eye_port=0, vrcft_port=0, epochs=1, batch_size=64,
+                     mixed_precision=False, input_mode="face",
+                     classes=[ExpressionClass("neutral", ["n.mmap"]),
+                              ExpressionClass("smile", ["s.mmap", "faceonly.mmap"], "JawOpen")])
+        model, _ = train(cfg, log_fn=lambda *a: None, device=torch.device("cpu"))
+        self.assertEqual(model.input_mode, "face")
+        self.assertEqual(model.conv1.in_channels, 64)
+
+        cfg.input_mode = "both"  # the face-only recording can't feed a both-model
+        with self.assertRaises(ValueError):
+            train(cfg, log_fn=lambda *a: None, device=torch.device("cpu"))
+        cfg.input_mode = "face"
+
+        engine = Engine(cfg)
+        engine.device = torch.device("cpu")
+        engine.start()
+        self.addCleanup(engine.stop)
+        engine.model = model
+        vr = socket.create_connection(("127.0.0.1", engine.vrcft.port))
+        self.addCleanup(vr.close)
+        self.assertTrue(wait_for(lambda: engine.vrcft.connected))
+        engine.start_inference()
+        face = socket.create_connection(("127.0.0.1", engine.source.ports[1]))
+        self.addCleanup(face.close)
+        face.sendall(packet(neural(1.0)))
+        vr.settimeout(3)
+        self.assertEqual(recv_exact(vr, 5)[:3], bytearray([2, 1, 3]))
+        self.assertIsNone(engine.status()["mode_hint"])
+        engine.set_input_mode("both")  # a face model can't run in both mode
+        self.assertIsNone(engine.model)
+        self.assertFalse(engine.inferring)
+
+    def test_mode_hint(self):
+        e = Engine(Config(input_mode="both"))
+        ok = {"state": "ok"}
+        off = {"state": "disconnected"}
+        self.assertEqual(e.mode_hint({"eye": off, "face": ok}), "single")
+        self.assertEqual(e.mode_hint({"eye": ok, "face": off}), "single")
+        self.assertIsNone(e.mode_hint({"eye": ok, "face": ok}))
+        self.assertIsNone(e.mode_hint({"eye": off, "face": off}))
+        e.cfg.input_mode = "face"
+        self.assertEqual(e.mode_hint({"eye": ok, "face": ok}), "both")
+
+
 class ConfigTests(unittest.TestCase):
     def test_roundtrip(self):
         cfg = default_config()

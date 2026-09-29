@@ -24,7 +24,8 @@ def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CONFIG_PATH
     cfg = Config.load(config_path)
     hub = FrameHub()
-    receiver = SRanipalReceiver(hub, cfg.bind_host, cfg.face_port, cfg.eye_port, swapped=cfg.swapped).start()
+    receiver = SRanipalReceiver(hub, cfg.bind_host, cfg.face_port, cfg.eye_port, swapped=cfg.swapped,
+                                mode=cfg.input_mode, stall_timeout=cfg.stall_timeout).start()
     server = ProxyServer(hub, cfg.bind_host, cfg.proxy_port).start()
     log.info("Serving samples on %s:%d", cfg.bind_host, cfg.proxy_port)
 

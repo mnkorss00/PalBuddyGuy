@@ -20,6 +20,7 @@ import time
 import numpy as np
 import torch
 
+from .config import channels_for
 from .datasets import open_recording
 from .model import BuddyNet, pick_device
 
@@ -31,9 +32,10 @@ class TrainingCancelled(Exception):
 
 
 class BatchSampler:
-    def __init__(self, recordings_per_class, batch_size, seed=None):
+    def __init__(self, recordings_per_class, batch_size, seed=None, channels=slice(0, 128)):
         self.classes = recordings_per_class  # list[list[array (N,128,20,20)]]
         self.batch_size = batch_size
+        self.channels = channels  # only the tracker(s) in use are read from disk
         self.rng = np.random.default_rng(seed)
         self.num_classes = len(recordings_per_class)
         self.eye = np.eye(self.num_classes, dtype=np.float32)
@@ -41,7 +43,8 @@ class BatchSampler:
     def sample(self):
         b = self.batch_size
         cls = self.rng.integers(0, self.num_classes, size=b)
-        x = np.empty((b, 128, 20, 20), dtype=np.float32)
+        ch = self.channels
+        x = np.empty((b, ch.stop - ch.start, 20, 20), dtype=np.float32)
         for c in np.unique(cls):
             slots = np.nonzero(cls == c)[0]
             recs = self.classes[c]
@@ -51,11 +54,23 @@ class BatchSampler:
                 rec = recs[f]
                 idx = self.rng.integers(0, len(rec), size=len(s))
                 order = np.argsort(idx)  # sequential-ish disk access for memmaps
-                x[s[order]] = rec[idx[order]]
+                x[s[order]] = rec[idx[order], ch]
         return x, self.eye[cls]
 
 
+def check_recording(rec, channels, path):
+    """Refuse recordings that have no data for a tracker the model needs, e.g.
+    training "both" on a recording made with only the facial tracker."""
+    probe = rec[np.linspace(0, len(rec) - 1, num=min(8, len(rec))).astype(int)]
+    for name, sl in (("eye", slice(0, 64)), ("face", slice(64, 128))):
+        inside = sl.start >= channels.start and sl.stop <= channels.stop
+        if inside and not np.any(probe[:, sl]):
+            raise ValueError("Recording '%s' contains no %s tracker data (it was recorded without that "
+                             "tracker), so it can't be used in this input mode." % (path, name))
+
+
 def load_recordings(cfg, log_fn=print):
+    channels = channels_for(cfg.input_mode)
     recordings = []
     total = 0
     for c in cfg.classes:
@@ -66,6 +81,7 @@ def load_recordings(cfg, log_fn=print):
                 rec = open_recording(path, in_ram=cfg.cache_datasets_in_ram)
             except FileNotFoundError:
                 raise FileNotFoundError("Recording '%s' of class '%s' not found" % (path, c.name))
+            check_recording(rec, channels, path)
             recs.append(rec)
             total += len(rec)
         if not recs:
@@ -82,9 +98,11 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
     on_progress = on_progress or (lambda **kw: None)
 
     recordings, total_frames = load_recordings(cfg, log_fn)
-    model = init_model if init_model is not None else BuddyNet(cfg.num_classes)
+    model = init_model if init_model is not None else BuddyNet(cfg.num_classes, cfg.input_mode)
     if model.num_outputs != cfg.num_classes:
         raise ValueError("Model output count does not match the class list")
+    if model.input_mode != cfg.input_mode:
+        raise ValueError("Model input mode '%s' does not match '%s'" % (model.input_mode, cfg.input_mode))
     model.to(device).train()
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -99,7 +117,7 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
 
     # one "epoch" = as many samples as the original: 2048 frames per class
     steps = max(1, (2048 * cfg.num_classes) // cfg.batch_size)
-    sampler = BatchSampler(recordings, cfg.batch_size)
+    sampler = BatchSampler(recordings, cfg.batch_size, channels=channels_for(cfg.input_mode))
     q = queue.Queue(maxsize=6)
     producer_stop = threading.Event()
 

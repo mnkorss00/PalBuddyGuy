@@ -82,6 +82,21 @@ STRINGS = {
     "error": ("Error", "오류"),
     "confirm_delete": ("Delete %s?", "%s 파일을 삭제할까요?"),
     "pick_class": ("Add to which class?", "어느 클래스에 추가할까요?"),
+    "input_mode": ("Input", "입력 방식"),
+    "mode_both": ("Eye + face trackers", "눈 + 입 (두 트래커)"),
+    "mode_face": ("Face tracker only", "입만 (페이셜 트래커)"),
+    "mode_eye": ("Eye tracker only", "눈만 (Pro Eye)"),
+    "not_used": ("not used", "사용 안 함"),
+    "hint_both": ("Both trackers are streaming. Use both?", "두 트래커가 모두 연결되어 있습니다. 둘 다 사용할까요?"),
+    "hint_single": ("Only one tracker is streaming. Check the preview and pick which one it is:",
+                    "트래커가 하나만 연결되어 있습니다. 미리보기를 보고 어느 쪽인지 고르세요:"),
+    "use_both": ("Use both", "둘 다 사용"),
+    "use_face": ("Face only", "입만"),
+    "use_eye": ("Eye only", "눈만"),
+    "mode_retrain": ("A model only works with the input mode it was trained for. After switching, "
+                     "train again (existing eye+face recordings can be reused).",
+                     "모델은 학습할 때의 입력 방식에서만 동작합니다. 바꾼 뒤에는 다시 학습하세요 "
+                     "(눈+입으로 녹화한 파일은 그대로 재사용할 수 있습니다)."),
     "fastcal_help": ("FastCal puppets each shape on your avatar; copy it with your face.",
                      "FastCal은 아바타에 각 표정을 차례로 보여줍니다. 얼굴로 따라 하세요."),
 }

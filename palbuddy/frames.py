@@ -37,11 +37,17 @@ def decode_neural(data):
     return np.frombuffer(data, dtype=np.float32).reshape(64, 20, 20)
 
 
+ZERO_NEURAL = bytes(NEURAL_BYTES)
+
+
 def sample_array(eye, face):
-    """(128, 20, 20) float32, eye first, matching the original training layout."""
-    out = np.empty(SAMPLE_SHAPE, dtype=np.float32)
-    out[:64] = decode_neural(eye)
-    out[64:] = decode_neural(face)
+    """(128, 20, 20) float32, eye first, matching the original training layout.
+    A missing tracker (None) is stored as zeros."""
+    out = np.zeros(SAMPLE_SHAPE, dtype=np.float32)
+    if eye is not None:
+        out[:64] = decode_neural(eye)
+    if face is not None:
+        out[64:] = decode_neural(face)
     return out
 
 
@@ -159,11 +165,14 @@ class SRanipalReceiver:
       * per-stream fps / stall status for the GUI.
     """
 
-    def __init__(self, hub, host="127.0.0.1", face_port=18452, eye_port=18453, swapped=False):
+    def __init__(self, hub, host="127.0.0.1", face_port=18452, eye_port=18453, swapped=False, mode="both",
+                 stall_timeout=2.0):
         self.hub = hub
         self.host = host
         self.ports = (face_port, eye_port)
         self.swapped = swapped
+        self.mode = mode  # "both", "face" or "eye"
+        self.stall_timeout = stall_timeout
         self.status = {"port0": StreamStatus("port %d" % face_port), "port1": StreamStatus("port %d" % eye_port)}
         self._last_eye = None
         self._active = [None, None]
@@ -175,10 +184,35 @@ class SRanipalReceiver:
         """'face' or 'eye' for the given port index, honouring the swap flag."""
         return "face" if (port_index == 0) != self.swapped else "eye"
 
+    def _port_in_use(self, index):
+        """True if a tracker is (or was, during this connection) sending on that port.
+        A tracker that merely stalls for a moment stays "in use", so its partner's
+        data is never mistaken for it."""
+        st = self.status["port%d" % index]
+        return st.connected and bool(st.last_frame)
+
+    def effective_role(self, index):
+        """Role used for the data of this port.
+
+        With a single tracker (mode "face"/"eye") the one stream may land on
+        either port - which port SRanipal picks isn't fixed. If the other port
+        has no tracker, whatever arrives must be the tracker we're using, so
+        no manual swap is needed."""
+        role = self.role(index)
+        if self.mode in ("face", "eye") and role != self.mode and not self._port_in_use(1 - index):
+            return self.mode
+        return role
+
     def set_swapped(self, value):
         self.swapped = bool(value)
         self._last_eye = None
         self.hub.clear()
+
+    def set_mode(self, mode):
+        self.mode = mode
+        self._last_eye = None
+        self.hub.clear()
+        self.hub.cameras.update(eye=None, face=None)
 
     def start(self):
         ports = []
@@ -222,6 +256,7 @@ class SRanipalReceiver:
     def _handle(self, index, conn, addr):
         st = self.status["port%d" % index]
         st.connected = True
+        st.last_frame = 0.0
         st.peer = "%s:%d" % addr
         st.connections += 1
         tune_stream(conn, low_latency=False)
@@ -239,13 +274,20 @@ class SRanipalReceiver:
                     break
                 recv_exact_into(conn, payload_view[:length])
                 data = bytes(payload_view[:length])
-                role = self.role(index)
+                role = self.effective_role(index)
                 if length == CAMERA_BYTES:
                     self.hub.cameras[role] = data
                     continue
                 st.last_frame = time.monotonic()
                 st.fps.tick(st.last_frame)
-                if role == "eye":
+                mode = self.mode
+                if mode == "face":
+                    if role == "face":
+                        self.hub.push(None, data)
+                elif mode == "eye":
+                    if role == "eye":
+                        self.hub.push(data, None)
+                elif role == "eye":
                     self._last_eye = data
                 elif self._last_eye is not None:
                     self.hub.push(self._last_eye, data)
@@ -259,11 +301,16 @@ class SRanipalReceiver:
                 st.connected = False
 
     def snapshot(self, stall_timeout=2.0):
+        rank = {"ok": 2, "stalled": 1, "disconnected": 0}
         out = {}
         for i in (0, 1):
             snap = self.status["port%d" % i].snapshot(stall_timeout)
-            snap["role"] = self.role(i)
-            out[snap["role"]] = snap
+            snap["role"] = role = self.effective_role(i)
+            if role not in out or rank[snap["state"]] > rank[out[role]["state"]]:
+                out[role] = snap
+        for role in ("eye", "face"):
+            out.setdefault(role, {"name": "-", "state": "disconnected", "fps": 0.0, "peer": None,
+                                  "connections": 0, "role": role})
         return out
 
 
@@ -283,6 +330,9 @@ class ProxyClient:
 
     def set_swapped(self, value):
         log.warning("In proxy mode, use the 'swap' command of tvm_proxy.py")
+
+    def set_mode(self, mode):
+        pass  # the proxy always sends both halves (zeros for a missing tracker)
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True, name="proxy-client").start()
@@ -371,7 +421,8 @@ class ProxyServer:
                 seq, sample = self.hub.wait_next(seq, timeout=1.0)
                 if sample is None:
                     continue
-                conn.sendall(sample[0] + sample[1])
+                eye, face = sample
+                conn.sendall((eye or ZERO_NEURAL) + (face or ZERO_NEURAL))
         except OSError as e:
             log.info("Proxy client %s:%d left: %s", addr[0], addr[1], e)
         finally:

@@ -6,7 +6,9 @@ existing buddyguy.pt files load unchanged. Differences:
     monkey-patching the dropout functions to identity for inference,
   * flatten(1) instead of reshaping with the global batch_size (which broke
     whenever the last batch or an inference batch had a different size),
-  * runs on CPU when CUDA isn't available.
+  * runs on CPU when CUDA isn't available,
+  * can take only the eye (64 ch) or only the face (64 ch) features, for
+    setups with a single tracker. The checkpoint records which.
 """
 
 import logging
@@ -27,10 +29,12 @@ def pick_device():
 
 
 class BuddyNet(nn.Module):
-    def __init__(self, num_outputs):
+    def __init__(self, num_outputs, input_mode="both"):
         super().__init__()
         self.num_outputs = num_outputs
-        self.conv1 = nn.Conv2d(128, 256, 3, stride=2, padding=1)
+        self.input_mode = input_mode
+        in_channels = 128 if input_mode == "both" else 64
+        self.conv1 = nn.Conv2d(in_channels, 256, 3, stride=2, padding=1)
         self.conv2 = nn.Conv2d(256, 256, 3, stride=1, padding=1)
         self.linear1 = nn.Linear(25600, 1024)
         self.linear2 = nn.Linear(1024, num_outputs)
@@ -50,18 +54,26 @@ class BuddyNet(nn.Module):
         data = {name: getattr(self, name).state_dict() for name in ("conv1", "conv2", "linear1", "linear2")}
         if class_names is not None:
             data["class_names"] = list(class_names)
+        data["input_mode"] = self.input_mode
         torch.save(data, tmp)
         os.replace(tmp, path)  # never leave a half-written checkpoint behind
 
     @classmethod
-    def load(cls, path, device=None, expected_outputs=None):
+    def load(cls, path, device=None, expected_outputs=None, expected_mode=None):
         data = torch.load(path, map_location="cpu")
         n = data["linear2"]["weight"].shape[0]
         if expected_outputs is not None and n != expected_outputs:
             raise ValueError(
                 "Model in %s has %d outputs but %d classes are configured. Retrain or fix the class list."
                 % (path, n, expected_outputs))
-        model = cls(n)
+        in_channels = data["conv1"]["weight"].shape[1]
+        # checkpoints from the original script have no "input_mode" and are always "both"
+        mode = data.get("input_mode") or ("both" if in_channels == 128 else expected_mode or "face")
+        if expected_mode is not None and mode != expected_mode:
+            raise ValueError(
+                "Model in %s was trained for input '%s' but input mode '%s' is selected. "
+                "Switch the input mode back or retrain." % (path, mode, expected_mode))
+        model = cls(n, mode)
         for name in ("conv1", "conv2", "linear1", "linear2"):
             getattr(model, name).load_state_dict(data[name])
         model.class_names = data.get("class_names")

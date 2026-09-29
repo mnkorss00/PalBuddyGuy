@@ -22,7 +22,8 @@ from .params import LIP_SHAPES
 
 log = logging.getLogger(__name__)
 
-STATE_COLORS = {"ok": "#2e9d4f", "stalled": "#d69a00", "disconnected": "#c0392b"}
+STATE_COLORS = {"ok": "#2e9d4f", "stalled": "#d69a00", "disconnected": "#c0392b", "not_used": "#9a9a9a"}
+MODES = ("both", "face", "eye")
 PREVIEW_SCALE = 2
 
 
@@ -193,6 +194,23 @@ class App:
         ttk.Checkbutton(row, text=t("preview"), variable=self.show_preview,
                         command=self.on_preview_toggle).pack(side="left", padx=8)
 
+        self.mode_labels = {m: t("mode_" + m) for m in MODES}
+        self.mode_var = tk.StringVar(value=self.mode_labels.get(self.cfg.input_mode, self.mode_labels["both"]))
+        mode_box = self.mode_box = ttk.LabelFrame(self.nb, text=t("input_mode"), padding=6)
+        mode_combo = ttk.Combobox(mode_box, textvariable=self.mode_var, state="readonly", width=26,
+                                  values=[self.mode_labels[m] for m in MODES])
+        mode_combo.pack(anchor="w")
+        mode_combo.bind("<<ComboboxSelected>>", lambda e: self.on_mode(self._mode_from_label()))
+        ttk.Label(mode_box, text=t("mode_retrain"), foreground="#666", wraplength=520).pack(anchor="w", pady=(4, 0))
+        self.hint_frame = ttk.Frame(mode_box)
+        self.hint_label = ttk.Label(self.hint_frame, text="", foreground="#c05000", wraplength=520)
+        self.hint_label.pack(anchor="w")
+        hint_btns = ttk.Frame(self.hint_frame)
+        hint_btns.pack(anchor="w", pady=(2, 0))
+        self.hint_buttons = {m: ttk.Button(hint_btns, text=t("use_" + m), command=lambda m=m: self.on_mode(m))
+                             for m in MODES}
+        self.shown_hint = None
+
         right = ttk.Frame(tab, padding=(10, 0))
         right.pack(side="left", fill="both", expand=True)
         ctl = ttk.Frame(right)
@@ -208,6 +226,8 @@ class App:
         self.infer_stats.pack(anchor="w", pady=(6, 0))
         self.fastcal_label = ttk.Label(right, text=t("fastcal_help"), foreground="#666")
         self.fastcal_label.pack(anchor="w", pady=(2, 6))
+        mode_box.pack(in_=right, fill="x", pady=(0, 6))
+        mode_box.lift(right)  # created before `right`, so raise it above its container
 
         self.bars_frame = ttk.LabelFrame(right, text=t("outputs"), padding=6)
         self.bars_frame.pack(fill="both", expand=True)
@@ -458,12 +478,28 @@ class App:
     def _refresh_status(self):
         s = self.engine.status()
         t = self.t
+        mode = s["input_mode"]
         for key in ("eye", "face"):
             snap = s["streams"].get(key, {"state": "disconnected", "fps": 0})
+            state = snap["state"]
+            if mode not in ("both", key) and state != "ok":
+                state = "not_used"
             dot, lbl = self.status_labels[key]
-            dot.itemconfigure("dot", fill=STATE_COLORS[snap["state"]])
-            lbl.configure(text="%s: %s%s" % (t(key), t(snap["state"]),
-                                             " (%.0f fps)" % snap["fps"] if snap["state"] == "ok" else ""))
+            dot.itemconfigure("dot", fill=STATE_COLORS[state])
+            lbl.configure(text="%s: %s%s" % (t(key), t(state),
+                                             " (%.0f fps)" % snap["fps"] if state == "ok" else ""))
+        hint = s.get("mode_hint")
+        if hint != self.shown_hint:
+            self.shown_hint = hint
+            for b in self.hint_buttons.values():
+                b.pack_forget()
+            if hint:
+                self.hint_label.configure(text=t("hint_" + hint))
+                for m in (("both",) if hint == "both" else ("face", "eye")):
+                    self.hint_buttons[m].pack(side="left", padx=(0, 6))
+                self.hint_frame.pack(anchor="w", pady=(6, 0))
+            else:
+                self.hint_frame.pack_forget()
         v = s["vrcft"]
         dot, lbl = self.status_labels["vrcft"]
         state = "ok" if v.get("connected") else "disconnected"
@@ -508,10 +544,11 @@ class App:
     def _refresh_preview(self):
         if self.show_preview.get() and self.nb.index("current") == 0:
             cams = self.engine.hub.cameras
+            mode = self.cfg.input_mode
             img = np.zeros((200, 200), dtype=np.uint8)
-            if cams.get("eye") is not None:
+            if cams.get("eye") is not None and mode in ("both", "eye"):
                 img[:100] = decode_camera(cams["eye"])
-            if cams.get("face") is not None:
+            if cams.get("face") is not None and mode in ("both", "face"):
                 img[100:] = decode_camera(cams["face"], flipped=True)
             if PREVIEW_SCALE > 1:
                 img = img.repeat(PREVIEW_SCALE, 0).repeat(PREVIEW_SCALE, 1)
@@ -566,6 +603,17 @@ class App:
 
     def on_swap(self):
         self.engine.set_swapped(not self.cfg.swapped)
+
+    def _mode_from_label(self):
+        label = self.mode_var.get()
+        return next(m for m, text in self.mode_labels.items() if text == label)
+
+    def on_mode(self, mode):
+        try:
+            self.engine.set_input_mode(mode)
+        except Exception as e:
+            self._error(e)
+        self.mode_var.set(self.mode_labels[self.cfg.input_mode])
 
     def on_preview_toggle(self):
         self.cfg.show_preview = self.show_preview.get()

@@ -15,6 +15,16 @@ from .params import shape_id
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
+# Which trackers feed the network. Recordings always store both halves
+# (eye channels 0-63, face channels 64-127; a missing tracker is zero-filled),
+# so a recording made with both trackers can be reused for any mode.
+INPUT_MODES = ("both", "face", "eye")
+INPUT_CHANNELS = {"both": slice(0, 128), "eye": slice(0, 64), "face": slice(64, 128)}
+
+
+def channels_for(mode):
+    return INPUT_CHANNELS[mode]
+
 
 @dataclass
 class ExpressionClass:
@@ -48,6 +58,8 @@ class Config:
     source: str = "direct"
     swapped: bool = False
     stall_timeout: float = 2.0  # seconds without frames before a stream counts as stalled
+    # "both" (eye + face tracker), "face" (facial tracker only) or "eye" (Pro Eye only)
+    input_mode: str = "both"
 
     # Recording
     record_frames: int = 2048
@@ -88,6 +100,8 @@ class Config:
 
     def validate(self):
         problems = []
+        if self.input_mode not in INPUT_MODES:
+            problems.append("input_mode must be one of %s." % ", ".join(INPUT_MODES))
         if not self.classes:
             problems.append("No expression classes are configured.")
         for c in self.classes:

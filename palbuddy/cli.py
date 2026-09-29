@@ -15,6 +15,7 @@ log = logging.getLogger("palbuddy")
 HELP = """commands:
   status             connection / fps overview
   swap               swap eye and face streams (saved in config.json)
+  mode [both|face|eye]  which trackers feed the network (show / change)
   record [name]      record a dataset
   train              train on the classes in config.json
   save / load        save / load the model
@@ -60,12 +61,26 @@ def run_cli(engine):
                 s = engine.status()
                 for role, st in s["streams"].items():
                     print("  %-5s %-12s %5.1f fps  %s" % (role, st["state"], st["fps"], st.get("peer") or ""))
+                print("  input mode %s%s" % (s["input_mode"], {
+                    "single": "  (only one tracker is streaming: 'mode face' or 'mode eye')",
+                    "both": "  (both trackers are streaming: 'mode both')"}.get(s["mode_hint"], "")))
                 print("  vrcft %s  device %s  inferring %s  model %s" % (
                     "connected" if s["vrcft"]["connected"] else "disconnected", s["device"], s["inferring"],
                     "loaded" if s["model_loaded"] else "-"))
             elif cmd == "swap":
                 engine.set_swapped(not engine.cfg.swapped)
                 print("swapped = %s" % engine.cfg.swapped)
+            elif cmd == "mode":
+                if arg:
+                    if arg not in ("both", "face", "eye"):
+                        raise ValueError("mode must be both, face or eye")
+                    engine.set_input_mode(arg)
+                print("input mode = %s" % engine.cfg.input_mode)
+                hint = engine.status()["mode_hint"]
+                if hint == "single":
+                    print("only one tracker is streaming: use 'mode face' or 'mode eye'")
+                elif hint:
+                    print("both trackers are streaming: consider 'mode both'")
             elif cmd == "record":
                 name = arg or input("dataset name: ")
                 done_event.clear()
