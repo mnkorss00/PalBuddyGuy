@@ -1,59 +1,90 @@
 # Pal Buddy Guy: The anipal's best friend
-This is a small script to improve upon the tracking capabilities of the Vive Pro Eye and facial tracker. You can create custom expressions by making the expression and calibrating on that parameter.
+This project improves on the tracking of the Vive Pro Eye and the Vive Facial Tracker. You make an expression, record it, and train a small network that drives a VRCFaceTracking parameter from it.
 
+It now comes with a GUI, and one process handles receiving data, recording, training, calibration and output.
 
-# SYSTEM REQUIREMENTS
-Currently this requires a CUDA-capable (nvidia) GPU with at least 4gb vram. It is possible to support AMD GPUs, but this will take some additional development work. Also, the current example script requires both the eye and face tracker. However, it would be simple to adapt it to work with only eye or only face.
+> 한국어 요약은 [아래](#한국어-빠른-시작)에 있습니다.
 
+# System requirements
+* An NVIDIA GPU with CUDA and at least 4 GB of VRAM is recommended. The code also runs on CPU (and Apple MPS), but training will be slow.
+* The example setup uses both the eye tracker and the face tracker.
+* Python 3.8+ with PyTorch.
 
 # Installation
-You must first replace the tvm_runtime and opencl DLLs inside SRanipal.
-Copy the two .DLL files from the "tvm runtime" folder into "C:\Program Files\VIVE\SRanipal" replacing the existing files. You should back up your old files incase you want to revert later.
-
-You then need to install Pytorch with gpu support. The easiest way to do so is using [anaconda](https://www.anaconda.com/products/individual).
-To install the runtime with anaconda, launch anaconda by searching "Anaconda prompt" in the start menu. Once open, run the following commands:
-```
-conda install cudatoolkit cudnn pip
-pip install torch==1.10.0+cu113 torchvision==0.11.1+cu113 torchaudio===0.10.0+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html
-pip install tqdm opencv-python numpy
-```
+1. Replace the tvm runtime inside SRanipal. Copy the two .DLL files from the `tvm runtime` folder into `C:\Program Files\VIVE\SRanipal`, replacing the existing files. Back up the old files first in case you want to revert.
+2. Install PyTorch with GPU support. Follow https://pytorch.org/get-started/locally/ (pip or conda).
+3. `pip install -r requirements.txt`
 
 # Running
+Start Pal Buddy Guy **before** SRanipalRuntime:
 
-Make sure to run this script before opening SRanipalRuntime!
+```
+python -m palbuddy          # GUI  (same as: python script.py)
+python -m palbuddy --cli    # text commands, like the old script
+python -m palbuddy --infer  # start tracking right away (e.g. from a shortcut)
+```
 
-Run tvm_proxy.py when you launch SRanipalRuntime. It is required by script.py
+You no longer need to start `tvm_proxy.py` separately, because the app receives the SRanipal streams itself. See *Legacy proxy mode* below if you still want a separate proxy.
 
-** output swapping **
-Before running any other commands, ensure the output window shows eye cameras on top, and face cameras below. If its reversed, run the comamand "swap" to swap them first.
-This will be handled automatically in a later release.
+All settings are saved in `config.json`, which is created on first start. You can edit them from the GUI; nothing has to be edited in the source code.
 
-** recording **
-To run this, you must first record some "calibration" data for the expressions you want.
-This *must* always include a "neutral" face recording. This is explained in more detail below.
-When recording you sould try to make movements during the 20-30 seconds that you are calibrating, just make sure the target expression you are calibrating for is the most predominant (this also includes like adjusting your headset and stuff while making the expression)
+## 1. Check the streams (Live tab)
+The status bar shows whether the eye tracker, face tracker and VRCFaceTracking are connected, and their frame rates.
+The camera preview should show the **eyes on top and the face below**. If they're reversed, click **Swap eye/face**. The choice is saved.
 
-the idea is to capture some diverse data where the primary consistent point is the target expression. Once you record one for each expression you want (both face and eyes are recorded at the same time) I can explain the next bit
+## 2. Record (Record tab)
+Enter a name and click **Record**. After the countdown, 2048 frames are captured (about 30 s) and written directly to `<dataset folder>/<name>-em.mmap`.
+* You *must* also record a **neutral** set. It doesn't have to be a truly neutral face. It should cover any faces you **don't** want to track: talking, looking around, blinking. That way the network learns what *not* to fire on.
+* While recording, keep the target expression dominant but move around a bit (adjust the headset, turn your head). The goal is diverse data where the target expression is the one constant.
+* Each recording is about 400 MB, so point the dataset folder (Settings tab) at a drive with space.
+* Old `.pkl` recordings can be converted with **Convert old .pkl**.
 
-You will also need to edit the top of script.py to change the save folder path. its not run directory cause each recording is 408mb so you need a decent amount of storage space free
+## 3. Configure classes and train (Train tab)
+Each class is one network output. The **first class must be neutral**. For each class, choose its recordings and, optionally, the SRanipal lip shape it should drive ("Drives shape"). You can also select recordings in the Record tab and click **Add to class…**.
+Click **Train**. The loss curve should drop below the 0.001 line by the end. If it doesn't, something is wrong with the recordings or the class list. Then click **Save model**.
 
-** training **
-Once you have recorded some datasets, edit script.py to include the filenames in the table at the top of the file.
-Run the script, and enter the "train" command. Once it finishes, make sure to run "save" to save the results. 
-Loss/Avg should be below 0.001 by the end. if not, something is wrong.
+## 4. Track and calibrate (Live tab)
+Click **Start tracking**. Each output is shown as its raw value and the value sent to VRCFT.
+**FastCal** puppets each shape on your avatar one after another. Copy it with your face. The measured strengths become each class's *max power*, which you can also edit by hand in the Train tab. **Smoothing** reduces jitter at the cost of a little latency.
 
-** inference **
-Run the script and enter "infer". This is what you will run when actually using the parameters
+# What changed compared to the original scripts
+**GUI**
+* Tkinter GUI (no extra dependencies) with live connection status, camera preview, output meters, recording with progress, a class/dataset editor, training with a live loss chart and ETA, FastCal, and settings. Available in English and Korean.
 
-# Tips
-For neutral face recordings, this shouldn't nesisarily be truly neutral face, but any faces that you aren't trying to track. I keep it mostly neutral but also do some taking, and make sure to look around/blink with the eye tracker (unless one of your parameters is related to that)
-This is basically to give the AI something to say "we aren't trying to look for this" so it doesnt have false positives.
+**Performance**
+* SRanipal is received in-process instead of through the proxy, which removes one TCP hop and one process.
+* Frames are handed over through a latest-sample slot with a condition variable. The old code used a list queue with `pop(0)` and polled in 1 ms sleep loops.
+* Inference runs once per *new* frame. The old loop recomputed the same frame and then slept 10 ms even when a new frame was waiting. It uses a pinned input buffer and `inference_mode`.
+* VRCFT updates go out as one packet per frame. The old code made 1 + 3·N tiny `send` calls with Nagle enabled.
+* Training: batches are built with one fancy-indexed read per recording and prepared by background threads while the GPU trains. Mixed precision (AMP) and cudnn autotuning are available. Recording writes straight to `.mmap`, so the `pkl → mmap` conversion step is gone.
+* Fixed the `batch_size` global hack: inference used to set it to 1 and swap the dropout functions out.
 
+**Connectivity**
+* Disconnects are detected. Before, `recv()` returned `b""` forever after a peer left, and the thread spun at 100 % CPU without ever reconnecting.
+* A restarted SRanipal or VRCFT replaces its stale connection automatically. There's no need to restart the script.
+* The VRCFT connection uses TCP_NODELAY and keepalive. A send timeout keeps a frozen VRCFT from stalling tracking.
+* All ports listen on `127.0.0.1` by default instead of on every network interface. This is configurable.
+* Ports are configurable, and there's a clear error message when a port is already in use.
+* The proxy client (legacy mode) reconnects with backoff.
+* The status bar shows each stream as connected, no data (stalled) or disconnected.
 
+The network architecture, the `buddyguy.pt` checkpoint format, the recording format and the VRCFT wire protocol are unchanged, so existing models, recordings and the VRCFT module keep working.
 
+# Legacy proxy mode
+If you want the receiver in its own process, run `python tvm_proxy.py` and set the input source to *proxy* in Settings (or `"source": "proxy"` in `config.json`).
 
+# Tests
+`python -m unittest discover tests` runs offline tests. They use fake SRanipal and VRCFT peers over loopback, and a tiny record → train → infer run on CPU.
 
+---
 
+# 한국어 빠른 시작
+1. `tvm runtime` 폴더의 DLL 두 개를 `C:\Program Files\VIVE\SRanipal`에 덮어씁니다 (원본은 백업해 두세요).
+2. GPU 지원 PyTorch를 설치하고 `pip install -r requirements.txt`를 실행합니다.
+3. **SRanipalRuntime보다 먼저** `python -m palbuddy`를 실행합니다. 이제 `tvm_proxy.py`는 따로 실행할 필요가 없습니다.
+4. **실시간** 탭: 위에 눈, 아래에 얼굴이 보이는지 확인합니다. 반대로 보이면 *눈/얼굴 뒤바꾸기*를 누르세요.
+5. **녹화** 탭: 이름을 입력하고 녹화합니다 (약 30초, 파일 하나에 약 400MB). `neutral`(무표정) 녹화는 반드시 있어야 합니다.
+6. **학습** 탭: 클래스별로 녹화 파일과 대상 파라미터를 지정합니다 (첫 번째 클래스는 neutral). *학습 시작*을 누르고, 손실이 0.001 아래로 내려가면 *모델 저장*을 누릅니다.
+7. **실시간** 탭: *트래킹 시작*을 누른 뒤 *빠른 보정(FastCal)*으로 아바타를 따라 하며 보정합니다.
 
-
-
+언어는 설정 탭에서 바꿀 수 있습니다 (auto / en / ko).

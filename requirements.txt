@@ -1,0 +1,5 @@
+# Install PyTorch with GPU support first, see https://pytorch.org/get-started/locally/
+torch>=1.10
+numpy
+# only needed for the camera window of the optional tvm_proxy.py
+opencv-python
