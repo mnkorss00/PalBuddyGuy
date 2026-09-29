@@ -122,19 +122,22 @@ For **VRCFaceTracking v6**, install the module from the app with **Install / upd
 
 Details, the protocol and how to build or test the module: [`vrcft-module/README.md`](vrcft-module/README.md).
 
-## Merged parameters (Merged tab)
-Combine two trained classes into **one custom avatar parameter**, sent straight to VRChat over OSC (127.0.0.1:9000 by default):
+## Direct OSC outputs: merged parameters and class parameters
+Besides driving VRCFaceTracking shapes, trained classes can go **straight to VRChat over OSC** (127.0.0.1:9000 by default) under custom avatar parameter names:
 
-    value = positive class - negative class        e.g. smile - sad, from -1 to 1
+* **Class parameter** (Train tab → class → *OSC parameter*): the class weight, 0..1.
+* **Merged parameter** (Merged tab): two classes combined as `value = positive - negative`, for example smile − sad from -1 to 1. The value is mapped to **-1..1** (neutral 0), **0..1** (neutral 0.5), **0..2** (neutral 1) or a custom min/max. With 0..2, for example, sad gives 0, neutral gives 1 and smile gives 2.
 
-The value is mapped to the range you choose: **-1..1** (neutral 0), **0..1** (neutral 0.5), **0..2** (neutral 1), or custom min/max. With 0..2, for example, sad gives 0, neutral gives 1 and smile gives 2. Add a float parameter with the same name to your avatar's expression parameters and animator.
+**Format**: *float*, *binary* or *both*, with a selectable resolution of 1–8 bits. Binary uses the same scheme as VRCFaceTracking's binary parameters: bools `<name>1`, `<name>2`, `<name>4`, … hold bit *i* of `int(value × 2^bits)`, with all bits set near 1, so existing VRCFT binary animator setups decode them. Ranges crossing 0 (like -1..1) add `<name>Negative` and encode the magnitude. Other ranges encode the position within the range (min end 0, max end 1). Bools are only sent when they change, plus a full refresh every second.
 
-* Either side may be empty, for example a positive class only.
-* Merged parameters are independent of the VRCFaceTracking targets. A class can drive a VRCFT shape and be part of a merged parameter at the same time.
-* When tracking stops, merged parameters are set back to their neutral value.
-* VRChat syncs float parameters in -1..1. Values outside that range, such as 0..2, only arrive as-is for local (unsynced) parameters. For synced ones, use -1..1 and rescale in the animator. The dialog warns about this.
-* Renaming a class updates the merged parameters that use it.
-* CLI: `merged`, `merged add SmileSad smile sad -1 1`, `merged remove SmileSad`.
+**Names that could disturb face tracking are refused.** VRCFaceTracking drives any avatar parameter whose name equals one of its parameters or ends with `/<name>` (so `PBG/SmileSad` would be driven by VRCFT's `SmileSad`), plus binary bits `<name><number>` and `<name>Negative`. The app checks every name an output would write against all 744 v1/v2/eye/head parameters and 367 binary parameters of VRCFaceTracking v6 (generated from its source into `palbuddy/vrcft_names.py`) and refuses clashes. So if you don't use these outputs, or use them with names like `PBG_SmileSad`, normal face tracking is untouched. Outputs that write the same parameter twice are refused as well. Invalid outputs never block training; they just aren't sent.
+
+When tracking stops, every output is set back to its neutral value. VRChat syncs float parameters in -1..1, so values outside that range (0..2) only arrive as-is for local, unsynced parameters. Binary parameters sync fine.
+
+CLI: `merged add PBG_SmileSad smile sad -1 1 binary 4`, `oscout sad PBG_Sad both 3`, `merged`, `merged remove NAME`.
+
+## Sensitivity (Live tab)
+If a class only moves between, say, 0.2 and 0.8, stretch that part back to 0..1. Click the class in the output list, then drag **Low end** / **High end**; orange marks show them on the bar. **Auto (5 s)** measures it for you: make a neutral face, then the full expression, and the 5th–95th percentile of what it saw becomes the range. The top bar shows the value before the adjustment and the bottom bar what is sent. The adjustment applies to VRCFaceTracking shapes and OSC outputs alike. CLI: `sens smile 0.2 0.8`.
 
 ## 7. Process priority (Settings tab → Inference performance)
 Tracking needs very little CPU, so by default the process runs at **below normal** priority and yields to VR and the game when the CPU is busy. On hybrid Intel CPUs (12th gen and later, e.g. the i7-12700K), **Efficiency cores only** keeps it off the P-cores entirely. On Windows 11, **Efficiency mode** (EcoQoS) lets the scheduler run it on slow, low-power cores. *low* priority is available too, but tracking may stutter when the CPU is fully loaded.
@@ -182,6 +185,7 @@ If you want the receiver in its own process, run `python tvm_proxy.py` and set t
 8. **설정 탭 → 추론 성능**: 기본값(자동: ONNX Runtime, CPU int8)으로도 가볍게 돌아갑니다. *이 PC에서 비교 측정*을 누르면 CPU/GPU/ONNX 중 어느 쪽이 이 PC에 맞는지 바로 확인할 수 있습니다. 학습 탭에서 *모델 크기 → 경량*을 고르면 추론이 약 5배 빨라집니다. 표준 모델과 검증 정확도를 비교해 보고 결정하세요.
 9. **설정 탭 → VRCFaceTracking 모듈 → 설치**: VRCFaceTracking v6용 모듈을 설치합니다. 먼저 VRCFaceTracking에서 SRanipal 모듈을 설치해 두세요. 설치하면 SRanipal 모듈은 Pal Buddy Guy 모듈 안에서 실행됩니다. v6는 눈과 표정을 각각 모듈 하나만 담당할 수 있기 때문입니다. 설치 후 VRCFaceTracking을 다시 시작하세요. *제거*를 누르면 원래대로 돌아갑니다. 대상 파라미터로 `BrowLowererLeft` 같은 **눈썹/눈 주변 표정**도 고를 수 있습니다.
 10. **프로세스 우선순위**: 기본값은 "보통 이하"라서 VR/게임에 CPU를 양보합니다. 12세대 이후 Intel CPU에서는 *E코어만 사용*, Windows 11에서는 *효율 모드*도 쓸 수 있습니다.
-11. **병합 파라미터 탭**: 두 클래스를 하나의 아바타 파라미터로 합칩니다. 값은 `긍정 − 부정`(예: 웃음 − 슬픔)이고, 범위는 **-1~1 / 0~1 / 0~2 / 직접 입력** 중에서 고릅니다. 값은 OSC로 VRChat에 직접 보내므로 아바타에 같은 이름의 float 파라미터를 추가하세요. VRChat의 동기화 float는 -1~1이라, 0~2는 동기화하지 않는 로컬 파라미터에서만 그대로 쓰입니다.
+11. **OSC 직접 출력**: 병합 파라미터 탭에서 두 클래스를 `긍정 − 부정`으로 합치거나(범위 -1~1 / 0~1 / 0~2 / 직접 입력), 학습 탭의 클래스 설정에서 *OSC 파라미터* 이름을 지정해 클래스 값(0~1)을 VRChat에 직접 보낼 수 있습니다. 형식은 **float / 바이너리 / 둘 다** 중에서 고르고, 바이너리는 **1~8비트**로 VRCFT 바이너리와 같은 방식입니다. **VRCFT가 쓰는 이름(v1/v2, 바이너리, `/이름` 경로 포함)은 사용할 수 없게 막아서** 기존 페이셜에 영향이 가지 않습니다. `PBG_SmileSad`처럼 고유한 이름을 쓰세요.
+12. **민감도 (실시간 탭)**: 출력 목록에서 클래스를 클릭하고 하한/상한 슬라이더를 조정하면, 예를 들어 0.2~0.8로만 움직이는 값을 0~1로 늘립니다. *자동 (5초)*을 누르고 무표정 → 최대 표정을 지으면 범위를 자동으로 잡아 줍니다.
 
 언어는 설정 탭에서 바꿀 수 있습니다 (auto / en / ko).

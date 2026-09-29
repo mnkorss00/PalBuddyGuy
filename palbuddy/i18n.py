@@ -40,13 +40,48 @@ STRINGS = {
     "perf_apply": ("Apply", "적용"),
     "vrcft_module": ("VRCFaceTracking module", "VRCFaceTracking 모듈"),
     "tab_merged": ("Merged", "병합 파라미터"),
+    "osc_format": ("OSC format", "OSC 형식"),
+    "fmt_float": ("float", "float"),
+    "fmt_binary": ("binary", "바이너리"),
+    "fmt_both": ("float + binary", "float + 바이너리"),
+    "osc_bits": ("bits", "비트 수"),
+    "osc_name": ("OSC parameter", "OSC 파라미터"),
+    "osc_name_hint": ("Optional: also send this class (0..1) straight to VRChat under this avatar parameter name. "
+                      "Names VRCFaceTracking uses (v1/v2, including binary and \"/Name\" paths) are refused so "
+                      "normal face tracking is never disturbed. Binary: <name>1, <name>2, <name>4 ... bools, "
+                      "decoded like VRCFaceTracking binary parameters.",
+                      "선택 사항: 이 클래스 값(0~1)을 이 이름의 아바타 파라미터로 VRChat에 직접 보냅니다. "
+                      "VRCFaceTracking이 쓰는 이름(v1/v2, 바이너리, \"/이름\" 경로 포함)은 기존 페이셜에 영향을 주지 않도록 "
+                      "막습니다. 바이너리: <이름>1, <이름>2, <이름>4 … bool 파라미터 (VRCFaceTracking 바이너리와 같은 방식)."),
+    "col_osc": ("OSC", "OSC"),
+    "sens_title_none": ("Sensitivity (click a class above)", "민감도 (위 목록에서 클래스를 클릭)"),
+    "sens_title": ("Sensitivity: %s", "민감도: %s"),
+    "sens_low": ("Low end", "하한"),
+    "sens_high": ("High end", "상한"),
+    "sens_auto": ("Auto (5 s)", "자동 (5초)"),
+    "sens_reset": ("Reset", "초기화"),
+    "sens_hint": ("The part of the range the expression really reaches (orange marks) is stretched to 0..1: "
+                  "e.g. a class that moves 0.2..0.8 -> set 0.2 and 0.8. Auto: during 5 s make a neutral face, "
+                  "then the full expression.",
+                  "표정이 실제로 움직이는 구간(주황색 표시)을 0~1로 늘립니다. 예: 0.2~0.8로만 움직이면 하한 0.2, 상한 0.8. "
+                  "자동: 5초 동안 무표정 → 최대 표정을 지어 주세요."),
+    "sens_need_tracking": ("Start tracking and select a class first.", "트래킹을 시작하고 클래스를 먼저 선택하세요."),
+    "sens_auto_running": ("Measuring... %.1f s  (neutral face, then the full expression)",
+                          "측정 중... %.1f초  (무표정 → 최대 표정)"),
+    "sens_auto_flat": ("The value hardly moved; nothing changed.", "값이 거의 움직이지 않아 변경하지 않았습니다."),
+    "binary_signed": ("Binary: sign (<name>Negative) + magnitude, like VRCFaceTracking.",
+                      "바이너리: 부호(<이름>Negative) + 크기, VRCFaceTracking과 같은 방식."),
+    "binary_unsigned": ("Binary: position within the range (min end = 0, max end = 1).",
+                        "바이너리: 범위 안의 위치 (min 쪽 = 0, max 쪽 = 1)."),
+    "merged_format": ("Format", "형식"),
     "merged_help": ("Combine two trained classes into one custom avatar parameter, sent to VRChat over OSC: "
                     "value = positive class - negative class (e.g. smile - sad), mapped to the range you pick "
-                    "(-1..1, 0..1, 0..2 or custom). Add a float parameter with the same name to your avatar. "
-                    "Values update while tracking.",
+                    "(-1..1, 0..1, 0..2 or custom), as a float and/or binary bools. Add parameters with the same "
+                    "name to your avatar (e.g. PBG_SmileSad). Names VRCFaceTracking uses are refused.",
                     "학습된 두 클래스를 하나의 아바타 파라미터로 합쳐 OSC로 VRChat에 보냅니다: "
-                    "값 = 긍정 클래스 − 부정 클래스 (예: 웃음 − 슬픔), 고른 범위(-1~1, 0~1, 0~2, 직접 입력)로 변환됩니다. "
-                    "아바타에 같은 이름의 float 파라미터를 추가하세요. 트래킹 중에 값이 갱신됩니다."),
+                    "값 = 긍정 클래스 − 부정 클래스 (예: 웃음 − 슬픔), 고른 범위(-1~1, 0~1, 0~2, 직접 입력)로 변환해 "
+                    "float 및/또는 바이너리로 보냅니다. 아바타에 같은 이름의 파라미터를 추가하세요 (예: PBG_SmileSad). "
+                    "VRCFaceTracking이 쓰는 이름은 사용할 수 없습니다."),
     "merged_dialog": ("Merged parameter", "병합 파라미터"),
     "merged_pos": ("Positive class (+)", "긍정 클래스 (+)"),
     "merged_neg": ("Negative class (-)", "부정 클래스 (-)"),

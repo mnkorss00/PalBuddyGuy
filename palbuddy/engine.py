@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from . import onnx_runtime
-from .config import Config, merged_param_problems
+from .config import Config, binary_bits, class_output_problems, merged_param_problems, osc_output_names
 from .datasets import Recorder, convert_legacy_pickles
 from .frames import FrameHub, ProxyClient, RateMeter, SRanipalReceiver
 from .osc import OscSender
@@ -56,7 +56,13 @@ class Engine:
         self.last_raw = None  # np.ndarray of raw outputs
         self.last_out = {}  # class index -> normalized value sent to VRCFT
         self.last_merged = {}  # merged parameter name -> value sent over OSC
+        self.last_class_raw = {}  # class index -> weight before the sensitivity range (0..1)
+        self.last_weights = {}  # class index -> final weight (0..1)
         self.osc = None
+        self._osc_plan_key = None
+        self._osc_plan = []
+        self._bool_state = {}  # OSC bool name -> last value sent
+        self._bool_refresh = 0.0
         self._smoothed = {}
 
     # ------------------------------------------------------------ lifecycle
@@ -82,14 +88,64 @@ class Engine:
 
     def active_merged_params(self):
         """Enabled merged parameters whose settings are valid."""
-        names = {c.name for c in self.cfg.classes}
-        return [m for m in self.cfg.merged_params if m.enabled and not merged_param_problems(m, names)]
+        return [obj for kind, obj in self.osc_plan() if kind == "merged"]
+
+    def osc_plan(self):
+        """[(kind, obj)] of the OSC outputs to send: classes with an OSC name ("class") and
+        enabled merged parameters ("merged") whose settings are valid (no clash with
+        VRCFaceTracking's names, no parameter written twice). Cached until settings change."""
+        cfg = self.cfg
+        key = (tuple((c.name, c.osc_name, c.osc_format, c.osc_bits) for c in cfg.classes),
+               tuple((m.name, m.positive, m.negative, m.out_min, m.out_max, m.enabled, m.osc_format, m.osc_bits)
+                     for m in cfg.merged_params))
+        if key != self._osc_plan_key:
+            plan, used = [], set()
+            names = {c.name for c in cfg.classes}
+            candidates = [("class", c) for c in cfg.classes if c.osc_name and not class_output_problems(c)]
+            candidates += [("merged", m) for m in cfg.merged_params
+                           if m.enabled and not merged_param_problems(m, names)]
+            for kind, obj in candidates:
+                out_name, signed = (obj.osc_name, False) if kind == "class" else (obj.name, obj.signed)
+                written = {n.lower() for n in osc_output_names(out_name, obj.osc_format, obj.osc_bits, signed)}
+                if written & used:
+                    log.warning("OSC output '%s' skipped: another output writes the same parameter", out_name)
+                    continue
+                used |= written
+                plan.append((kind, obj))
+            self._osc_plan_key, self._osc_plan = key, plan
+            self._bool_state = {}
+        return self._osc_plan
+
+    def _send_output(self, name, fmt, bits, value, binary_value, negative, signed, force=False):
+        """Send one OSC output as float and/or binary bools (bools only when they change)."""
+        if fmt in ("float", "both"):
+            self.osc.send_parameter(name, float(value))
+        if fmt in ("binary", "both"):
+            flags = [("%s%d" % (name, 1 << i), b) for i, b in enumerate(binary_bits(binary_value, bits))]
+            if signed:
+                flags.append((name + "Negative", bool(negative)))
+            for flag, b in flags:
+                if force or self._bool_state.get(flag) != b:
+                    self.osc.send_parameter(flag, b)
+                    self._bool_state[flag] = b
+
+    def _send_osc(self, weights, merged, force=False):
+        for kind, obj in self.osc_plan():
+            if kind == "class":
+                w = weights.get(obj.name, 0.0)
+                self._send_output(obj.osc_name, obj.osc_format, obj.osc_bits, w, w, False, False, force)
+            elif obj.name in merged:
+                mag, neg = obj.binary_input(weights)
+                self._send_output(obj.name, obj.osc_format, obj.osc_bits, merged[obj.name], mag, neg, obj.signed,
+                                  force)
 
     def _send_merged_neutral(self):
+        """Tracking stopped: leave every OSC output at its neutral value, not frozen."""
         if self.osc is not None and self.cfg.osc_enabled:
-            for m in self.active_merged_params():
-                self.osc.send_parameter(m.name, m.neutral)
+            neutral = {m.name: m.neutral for m in self.active_merged_params()}
+            self._send_osc({}, neutral, force=True)
         self.last_merged = {}
+        self._bool_state = {}
 
     @property
     def device(self):
@@ -502,16 +558,20 @@ class Engine:
             # per-class weight 0..1 (raw / max_power), smoothed; VRCFT gets 2w-1 in -1..1
             alpha = self.cfg.smoothing
             classes = self.cfg.classes
-            weights = {}
+            weights, class_raw, final = {}, {}, {}
             for idx, c in enumerate(classes):
                 if idx >= len(raw):
                     break
-                w = (normalize(raw[idx], c.max_power) + 1.0) / 2.0
+                w_raw = (normalize(raw[idx], c.max_power) + 1.0) / 2.0
+                class_raw[idx] = w_raw
+                w = c.remap(w_raw)  # sensitivity range, e.g. 0.2..0.8 -> 0..1
                 if 0.0 < alpha < 1.0:
                     prev = self._smoothed.get(idx, w)
                     w = prev * alpha + w * (1.0 - alpha)
                     self._smoothed[idx] = w
                 weights[c.name] = w
+                final[idx] = w
+            self.last_class_raw, self.last_weights = class_raw, final
             out, pairs = {}, []
             for idx, target, _ in self.cfg.targets():
                 if classes[idx].name in weights:
@@ -525,9 +585,11 @@ class Engine:
             if now - last_send >= min_interval:
                 if pairs:
                     self.vrcft.send_targets(pairs)
-                if merged and self.cfg.osc_enabled:
-                    for name, value in merged.items():
-                        self.osc.send_parameter(name, value)
+                if self.cfg.osc_enabled:
+                    refresh = now - self._bool_refresh > 1.0  # resend all bools now and then
+                    if refresh:
+                        self._bool_refresh = now
+                    self._send_osc(weights, merged, force=refresh)
                 last_send = now
         runtime.release()
         self._send_merged_neutral()  # leave merged parameters at neutral, not frozen

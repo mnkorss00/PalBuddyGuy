@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 
 from .params import is_valid_target
+from .vrcft_names import vrcft_conflict
 
 # config.json lives next to script.py / PalBuddyGuy.bat, independent of the working directory
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,12 +36,55 @@ class ExpressionClass:
     target: SRanipal lip shape to drive with this output (name or index), or None
             to only train it (e.g. the mandatory "neutral" class).
     max_power: raw network output that maps to a fully expressed shape (+1).
+    in_min, in_max: sensitivity - the part of the 0..1 range the expression really uses;
+            stretched back to 0..1 (e.g. 0.2..0.8 -> 0..1).
+    osc_name: optional custom avatar parameter the class weight (0..1) is sent to over OSC,
+            as a float and/or binary bools (osc_format, osc_bits).
     """
 
     name: str
     files: List[str] = field(default_factory=list)
     target: Optional[str] = None
     max_power: float = 0.9
+    in_min: float = 0.0
+    in_max: float = 1.0
+    osc_name: Optional[str] = None
+    osc_format: str = "float"
+    osc_bits: int = 4
+
+    def remap(self, w):
+        """Apply the sensitivity range to a weight in 0..1."""
+        span = self.in_max - self.in_min
+        if span <= 1e-6:
+            return 1.0 if w >= self.in_max else 0.0
+        return min(1.0, max(0.0, (w - self.in_min) / span))
+
+
+OSC_FORMATS = ("float", "binary", "both")
+MAX_BINARY_BITS = 8
+
+
+def osc_output_names(name, fmt, bits, signed):
+    """Every avatar parameter name an OSC output writes, VRCFaceTracking style:
+    float "<name>", binary bools "<name>1", "<name>2", "<name>4"... and "<name>Negative"."""
+    names = []
+    if fmt in ("float", "both"):
+        names.append(name)
+    if fmt in ("binary", "both"):
+        names += ["%s%d" % (name, 1 << i) for i in range(bits)]
+        if signed:
+            names.append(name + "Negative")
+    return names
+
+
+def binary_bits(value, bits):
+    """Same encoding as VRCFaceTracking's BinaryBaseParameter: bit i of int(value * 2^bits),
+    all bits set for value ~1. value in 0..1."""
+    value = min(1.0, max(0.0, float(value)))
+    if value > 0.99999:
+        return [True] * bits
+    big = int(value * (1 << bits))
+    return [bool((big >> i) & 1) for i in range(bits)]
 
 
 PARAM_NAME_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
@@ -65,13 +109,31 @@ class MergedParam:
     out_min: float = -1.0
     out_max: float = 1.0
     enabled: bool = True
+    osc_format: str = "float"
+    osc_bits: int = 4
+
+    def combined(self, weights):
+        """positive - negative, -1..1."""
+        pos = weights.get(self.positive, 0.0) if self.positive else 0.0
+        neg = weights.get(self.negative, 0.0) if self.negative else 0.0
+        return min(1.0, max(-1.0, pos - neg))
 
     def combine(self, weights):
         """weights: {class name: weight 0..1} -> output value."""
-        pos = weights.get(self.positive, 0.0) if self.positive else 0.0
-        neg = weights.get(self.negative, 0.0) if self.negative else 0.0
-        c = min(1.0, max(-1.0, pos - neg))
-        return self.out_min + (c + 1.0) / 2.0 * (self.out_max - self.out_min)
+        return self.out_min + (self.combined(weights) + 1.0) / 2.0 * (self.out_max - self.out_min)
+
+    @property
+    def signed(self):
+        """A range crossing 0: binary output uses sign + magnitude (a Negative bool), like VRCFT."""
+        return min(self.out_min, self.out_max) < 0 < max(self.out_min, self.out_max)
+
+    def binary_input(self, weights):
+        """(value 0..1 to encode, negative) for binary output. Signed ranges: |c| and c < 0;
+        otherwise the position within the range (0 = min end, 1 = max end)."""
+        c = self.combined(weights)
+        if self.signed:
+            return abs(c), c < 0
+        return (c + 1.0) / 2.0, False
 
     @property
     def neutral(self):
@@ -182,9 +244,26 @@ class Config:
                     problems.append("Class '%s' has an unknown target shape '%s'." % (c.name, c.target))
             if c.max_power <= 0:
                 problems.append("Class '%s' needs max_power > 0." % c.name)
+        return problems
+
+    def output_problems(self):
+        """Problems with OSC outputs (merged parameters, class OSC names). These don't block
+        training; invalid outputs are just not sent."""
+        problems = []
         names = {c.name for c in self.classes}
+        seen = {}
+        for c in self.classes:
+            if c.osc_name:
+                problems.extend(class_output_problems(c))
+                for n in osc_output_names(c.osc_name, c.osc_format, c.osc_bits, False):
+                    seen.setdefault(n.lower(), []).append(c.osc_name)
         for m in self.merged_params:
             problems.extend(merged_param_problems(m, names))
+            for n in osc_output_names(m.name, m.osc_format, m.osc_bits, m.signed):
+                seen.setdefault(n.lower(), []).append(m.name)
+        for n, owners in seen.items():
+            if len(owners) > 1:
+                problems.append("OSC parameter '%s' is written by more than one output (%s)." % (n, ", ".join(owners)))
         return problems
 
     # ---------------------------------------------------------------- io
@@ -223,11 +302,33 @@ class Config:
             return cls.from_dict(json.load(f))
 
 
+def _osc_name_problems(label, name, fmt, bits, signed):
+    problems = []
+    if not PARAM_NAME_RE.match(name or ""):
+        return ["%s '%s': use letters, digits, _ . / - only." % (label, name)]
+    if fmt not in OSC_FORMATS:
+        problems.append("%s '%s': format must be one of %s." % (label, name, ", ".join(OSC_FORMATS)))
+    if fmt != "float" and not 1 <= int(bits) <= MAX_BINARY_BITS:
+        problems.append("%s '%s': binary needs 1-%d bits." % (label, name, MAX_BINARY_BITS))
+    for n in osc_output_names(name, fmt, int(bits), signed):
+        clash = vrcft_conflict(n)
+        if clash:
+            problems.append("%s '%s': '%s' would clash with VRCFaceTracking's parameter '%s' and disturb "
+                            "normal face tracking. Pick another name." % (label, name, n, clash))
+            break
+    return problems
+
+
+def class_output_problems(c):
+    """Reasons a class's direct OSC output can't be used (empty = fine or not configured)."""
+    if not c.osc_name:
+        return []
+    return _osc_name_problems("OSC parameter", c.osc_name, c.osc_format, c.osc_bits, False)
+
+
 def merged_param_problems(m, class_names):
     """Reasons a merged parameter can't be used (empty list = fine)."""
-    problems = []
-    if not PARAM_NAME_RE.match(m.name or ""):
-        problems.append("Merged parameter '%s': use letters, digits, _ . / - only." % m.name)
+    problems = _osc_name_problems("Merged parameter", m.name, m.osc_format, m.osc_bits, m.signed)
     if not m.positive and not m.negative:
         problems.append("Merged parameter '%s' needs a positive or a negative class." % m.name)
     for side in (m.positive, m.negative):

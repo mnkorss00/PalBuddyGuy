@@ -4,16 +4,19 @@ Tk is not thread safe: worker threads only put messages on `self.events`,
 which the Tk main loop drains every 50 ms.
 """
 
+import dataclasses
 import locale
 import logging
 import os
 import queue
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
-from .config import RANGE_PRESETS, ExpressionClass, MergedParam, merged_param_problems
+from .config import (MAX_BINARY_BITS, OSC_FORMATS, RANGE_PRESETS, ExpressionClass, MergedParam,
+                     class_output_problems, merged_param_problems)
 from .datasets import frame_count
 from .engine import dataset_files
 from .frames import decode_camera
@@ -57,6 +60,27 @@ def gray_to_photo(img):
     return tk.PhotoImage(data=data, format="PPM")
 
 
+def format_row(parent, row, app, fmt_var, bits_var):
+    """OSC format (float / binary / both) + binary resolution widgets on one grid row."""
+    t = app.t
+    labels = {f: t("fmt_" + f) for f in OSC_FORMATS}
+    shown = tk.StringVar(value=labels.get(fmt_var.get(), labels["float"]))
+    ttk.Label(parent, text=t("osc_format")).grid(row=row, column=0, sticky="w", pady=2)
+    f = ttk.Frame(parent)
+    f.grid(row=row, column=1, columnspan=3, sticky="w", pady=2)
+    box = ttk.Combobox(f, textvariable=shown, values=list(labels.values()), state="readonly", width=16)
+    box.pack(side="left")
+    ttk.Label(f, text=t("osc_bits")).pack(side="left", padx=(10, 4))
+    spin = ttk.Spinbox(f, from_=1, to=MAX_BINARY_BITS, textvariable=bits_var, width=4)
+    spin.pack(side="left")
+
+    def sync(*_):
+        fmt_var.set(next(k for k, v in labels.items() if v == shown.get()))
+        spin.state(["disabled"] if fmt_var.get() == "float" else ["!disabled"])
+    box.bind("<<ComboboxSelected>>", sync)
+    sync()
+
+
 class ClassDialog(tk.Toplevel):
     def __init__(self, app, cls=None):
         super().__init__(app.root)
@@ -84,9 +108,21 @@ class ClassDialog(tk.Toplevel):
         self.power = tk.StringVar(value=str(cls.max_power))
         ttk.Entry(frm, textvariable=self.power, width=10).grid(row=2, column=1, sticky="w")
 
-        ttk.Label(frm, text=t("files_hint")).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.files = tk.Listbox(frm, selectmode="multiple", height=12, exportselection=False)
-        self.files.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        self.original = cls
+        ttk.Label(frm, text=t("osc_name")).grid(row=3, column=0, sticky="w", pady=(6, 2))
+        self.osc_name = tk.StringVar(value=cls.osc_name or "")
+        ttk.Entry(frm, textvariable=self.osc_name, width=30).grid(row=3, column=1, sticky="ew", pady=(6, 2))
+        self.osc_format = tk.StringVar(value=cls.osc_format)
+        self.osc_bits = tk.IntVar(value=cls.osc_bits)
+        fmt_frame = ttk.Frame(frm)
+        fmt_frame.grid(row=4, column=0, columnspan=2, sticky="w")
+        format_row(fmt_frame, 0, app, self.osc_format, self.osc_bits)
+        ttk.Label(frm, text=t("osc_name_hint"), foreground="#666", wraplength=420, justify="left").grid(
+            row=5, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(frm, text=t("files_hint")).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.files = tk.Listbox(frm, selectmode="multiple", height=10, exportselection=False)
+        self.files.grid(row=7, column=0, columnspan=2, sticky="nsew")
         available = dataset_files(app.engine.cfg)
         for f in cls.files:  # keep entries whose file is missing (e.g. on another drive)
             if f not in available:
@@ -97,11 +133,11 @@ class ClassDialog(tk.Toplevel):
                 self.files.selection_set(i)
 
         btns = ttk.Frame(frm)
-        btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(btns, text="OK", command=self.ok).pack(side="left", padx=4)
         ttk.Button(btns, text=t("cancel"), command=self.destroy).pack(side="left")
         frm.columnconfigure(1, weight=1)
-        frm.rowconfigure(4, weight=1)
+        frm.rowconfigure(7, weight=1)
         self.grab_set()
         self.wait_window()
 
@@ -118,7 +154,20 @@ class ClassDialog(tk.Toplevel):
             return
         target = self.target.get()
         files = [self.files.get(i) for i in self.files.curselection()]
-        self.result = ExpressionClass(name, files, None if target == self.none_label else target, power)
+        try:
+            bits = int(self.osc_bits.get())
+        except (ValueError, tk.TclError):
+            bits = 0
+        # keep fields this dialog doesn't edit (sensitivity range)
+        result = dataclasses.replace(self.original, name=name, files=files,
+                                     target=None if target == self.none_label else target, max_power=power,
+                                     osc_name=self.osc_name.get().strip() or None,
+                                     osc_format=self.osc_format.get(), osc_bits=bits)
+        problems = class_output_problems(result)
+        if problems:
+            messagebox.showerror(self.app.t("error"), "\n".join(problems), parent=self)
+            return
+        self.result = result
         self.destroy()
 
 
@@ -166,14 +215,17 @@ class MergedDialog(tk.Toplevel):
         ttk.Label(frm, text="max").grid(row=4, column=2, sticky="e")
         self.max_entry = ttk.Entry(frm, textvariable=self.max, width=8)
         self.max_entry.grid(row=4, column=3, sticky="w")
+        self.osc_format = tk.StringVar(value=param.osc_format)
+        self.osc_bits = tk.IntVar(value=param.osc_bits)
+        format_row(frm, 5, app, self.osc_format, self.osc_bits)
         ttk.Checkbutton(frm, text=t("merged_enabled"), variable=self.enabled).grid(
-            row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
+            row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self.preview = ttk.Label(frm, text="", foreground="#666", wraplength=380, justify="left")
-        self.preview.grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        for var in (self.pos, self.neg, self.min, self.max):
+        self.preview.grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        for var in (self.pos, self.neg, self.min, self.max, self.osc_format):
             var.trace_add("write", lambda *a: self._update_preview())
         btns = ttk.Frame(frm)
-        btns.grid(row=7, column=0, columnspan=4, sticky="e", pady=(8, 0))
+        btns.grid(row=8, column=0, columnspan=4, sticky="e", pady=(8, 0))
         ttk.Button(btns, text="OK", command=self.ok).pack(side="left", padx=4)
         ttk.Button(btns, text=t("cancel"), command=self.destroy).pack(side="left")
         self._apply_preset(initial=True)
@@ -196,8 +248,12 @@ class MergedDialog(tk.Toplevel):
 
     def _read(self):
         side = lambda v: None if v.get() == self.none_label else v.get()  # noqa: E731
+        try:
+            bits = int(self.osc_bits.get())
+        except (ValueError, tk.TclError):
+            bits = 0
         return MergedParam(self.name.get().strip(), side(self.pos), side(self.neg), float(self.min.get()),
-                           float(self.max.get()), bool(self.enabled.get()))
+                           float(self.max.get()), bool(self.enabled.get()), self.osc_format.get(), bits)
 
     def _update_preview(self):
         t = self.app.t
@@ -207,6 +263,8 @@ class MergedDialog(tk.Toplevel):
             self.preview.configure(text="")
             return
         text = t("merged_preview") % (m.negative or t("none"), m.out_min, m.neutral, m.positive or t("none"), m.out_max)
+        if m.osc_format != "float":
+            text += "\n" + t("binary_signed" if m.signed else "binary_unsigned")
         if m.beyond_sync_range:
             text += "\n" + t("merged_sync_warning")
         self.preview.configure(text=text, foreground="#c05000" if m.beyond_sync_range else "#666")
@@ -337,25 +395,147 @@ class App:
         mode_box.pack(in_=right, fill="x", pady=(0, 6))
         mode_box.lift(right)  # created before `right`, so raise it above its container
 
+        self._build_sensitivity_panel(right)
         self.bars_frame = ttk.LabelFrame(right, text=t("outputs"), padding=6)
         self.bars_frame.pack(fill="both", expand=True)
+
+    def _build_sensitivity_panel(self, parent):
+        """Per-class sensitivity: the part of 0..1 the expression really reaches is stretched
+        back to 0..1. Click a class in the list above to edit it."""
+        t = self.t
+        self.sens_class = None
+        self._sens_save_job = None
+        self._sens_auto = None
+        box = self.sens_box = ttk.LabelFrame(parent, text=t("sens_title_none"), padding=6)
+        box.pack(side="bottom", fill="x", pady=(6, 0))
+        self.sens_lo = tk.DoubleVar(value=0.0)
+        self.sens_hi = tk.DoubleVar(value=1.0)
+        for row, (label, var) in enumerate(((t("sens_low"), self.sens_lo), (t("sens_high"), self.sens_hi))):
+            ttk.Label(box, text=label, width=10).grid(row=row, column=0, sticky="w")
+            ttk.Scale(box, from_=0.0, to=1.0, variable=var, length=300,
+                      command=lambda _v, which=row: self.on_sensitivity(which)).grid(row=row, column=1, sticky="ew")
+        self.sens_value = ttk.Label(box, text="", width=16)
+        self.sens_value.grid(row=0, column=2, rowspan=2, padx=6)
+        btns = ttk.Frame(box)
+        btns.grid(row=0, column=3, rowspan=2, sticky="e")
+        ttk.Button(btns, text=t("sens_auto"), command=self.on_sensitivity_auto).pack(fill="x")
+        ttk.Button(btns, text=t("sens_reset"), command=self.on_sensitivity_reset).pack(fill="x", pady=(2, 0))
+        self.sens_hint = ttk.Label(box, text=t("sens_hint"), foreground="#666", wraplength=520, justify="left")
+        self.sens_hint.grid(row=2, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        box.columnconfigure(1, weight=1)
+        self._select_sensitivity(None)
+
+    def _select_sensitivity(self, index):
+        t = self.t
+        self.sens_class = index
+        for i, row in self.bars.items():
+            row[4].configure(background="#cfe0ff" if i == index else self._label_bg)
+        if index is None or index >= len(self.cfg.classes):
+            self.sens_class = None
+            self.sens_box.configure(text=t("sens_title_none"))
+            return
+        c = self.cfg.classes[index]
+        self.sens_box.configure(text=t("sens_title") % c.name)
+        self.sens_lo.set(c.in_min)
+        self.sens_hi.set(c.in_max)
+        self._show_sensitivity_values()
+
+    def _show_sensitivity_values(self):
+        if self.sens_class is None:
+            return
+        c = self.cfg.classes[self.sens_class]
+        self.sens_value.configure(text="%.2f .. %.2f" % (c.in_min, c.in_max))
+
+    def on_sensitivity(self, which):
+        if self.sens_class is None:
+            return
+        c = self.cfg.classes[self.sens_class]
+        lo, hi = round(self.sens_lo.get(), 2), round(self.sens_hi.get(), 2)
+        if hi - lo < 0.05:  # keep a usable range; move the other handle
+            if which == 0:
+                hi = min(1.0, lo + 0.05)
+                lo = hi - 0.05
+            else:
+                lo = max(0.0, hi - 0.05)
+                hi = lo + 0.05
+            lo, hi = round(lo, 2), round(hi, 2)
+            self.sens_lo.set(lo)
+            self.sens_hi.set(hi)
+        c.in_min, c.in_max = lo, hi
+        self._show_sensitivity_values()
+        if self._sens_save_job:
+            self.root.after_cancel(self._sens_save_job)
+        self._sens_save_job = self.root.after(600, self.engine.save_config)
+
+    def on_sensitivity_reset(self):
+        if self.sens_class is not None:
+            self.sens_lo.set(0.0)
+            self.sens_hi.set(1.0)
+            self.on_sensitivity(1)
+
+    def on_sensitivity_auto(self):
+        """Watch the selected class for a few seconds (neutral face, then the full expression)
+        and use the observed spread (5th..95th percentile) as its range."""
+        t = self.t
+        if self.sens_class is None or not self.engine.inferring:
+            self._error(t("sens_need_tracking"))
+            return
+        self._sens_auto = {"index": self.sens_class, "samples": [], "end": time.monotonic() + 5.0}
+        self._sens_auto_tick()
+
+    def _sens_auto_tick(self):
+        auto = self._sens_auto
+        if auto is None:
+            return
+        value = self.engine.last_class_raw.get(auto["index"])
+        if value is not None:
+            auto["samples"].append(value)
+        left = auto["end"] - time.monotonic()
+        if left > 0:
+            self.sens_hint.configure(text=self.t("sens_auto_running") % left, foreground="#c05000")
+            self.root.after(50, self._sens_auto_tick)
+            return
+        self._sens_auto = None
+        self.sens_hint.configure(text=self.t("sens_hint"), foreground="#666")
+        samples = np.asarray(auto["samples"])
+        if len(samples) < 10:
+            return
+        lo, hi = float(np.percentile(samples, 5)), float(np.percentile(samples, 95))
+        if hi - lo < 0.05:
+            self._error(self.t("sens_auto_flat"))
+            return
+        if self.sens_class == auto["index"]:
+            self.sens_lo.set(round(lo, 2))
+            self.sens_hi.set(round(hi, 2))
+            self.on_sensitivity(1)
 
     def _rebuild_bars(self):
         for w in self.bars_frame.winfo_children():
             w.destroy()
         self.bars = {}
         for i, c in enumerate(self.cfg.classes):
-            ttk.Label(self.bars_frame, text=c.name, width=14).grid(row=i, column=0, sticky="w")
-            cv = tk.Canvas(self.bars_frame, height=16, width=260, bg="#e6e6e6", highlightthickness=0)
+            name = tk.Label(self.bars_frame, text=c.name, width=14, anchor="w", cursor="hand2")
+            name.grid(row=i, column=0, sticky="w")
+            self._label_bg = name.cget("background")
+            cv = tk.Canvas(self.bars_frame, height=16, width=240, bg="#e6e6e6", highlightthickness=0, cursor="hand2")
             cv.grid(row=i, column=1, sticky="ew", pady=2)
-            raw = cv.create_rectangle(0, 0, 0, 16, fill="#8aa4c8", outline="")
+            raw = cv.create_rectangle(0, 0, 0, 10, fill="#8aa4c8", outline="")
             sent = cv.create_rectangle(0, 10, 0, 16, fill="#2e6fd1", outline="")
-            txt = ttk.Label(self.bars_frame, text="", width=18)
+            lo = cv.create_line(0, 0, 0, 16, fill="#e07000", width=2)
+            hi = cv.create_line(0, 0, 0, 16, fill="#e07000", width=2)
+            txt = ttk.Label(self.bars_frame, text="", width=13)
             txt.grid(row=i, column=2, sticky="w", padx=6)
-            target = ttk.Label(self.bars_frame, text=c.target or "", foreground="#666")
-            target.grid(row=i, column=3, sticky="w")
-            self.bars[i] = (cv, raw, sent, txt)
+            outputs = [c.target] if c.target else []
+            if c.osc_name:
+                outputs.append("OSC " + c.osc_name)
+            ttk.Label(self.bars_frame, text=", ".join(outputs), foreground="#666").grid(row=i, column=3, sticky="w")
+            for widget in (name, cv):
+                widget.bind("<Button-1>", lambda e, idx=i: self._select_sensitivity(idx))
+            self.bars[i] = (cv, raw, sent, txt, name, lo, hi)
         self.bars_frame.columnconfigure(1, weight=1)
+        if hasattr(self, "sens_box"):
+            self._select_sensitivity(self.sens_class if self.sens_class is not None
+                                     and self.sens_class < len(self.cfg.classes) else None)
 
     def _build_record_tab(self):
         t = self.t
@@ -405,16 +585,18 @@ class App:
         self.nb.add(tab, text=t("tab_train"))
         box = ttk.LabelFrame(tab, text=t("classes"), padding=6)
         box.pack(fill="both", expand=True)
-        cols = ("target", "power", "files")
+        cols = ("target", "osc", "power", "files")
         self.class_tree = ttk.Treeview(box, columns=cols, show="tree headings", height=8, selectmode="browse")
         self.class_tree.heading("#0", text=t("col_name"))
         self.class_tree.heading("target", text=t("col_target"))
+        self.class_tree.heading("osc", text=t("col_osc"))
         self.class_tree.heading("power", text=t("col_power"))
         self.class_tree.heading("files", text=t("col_files"))
-        self.class_tree.column("#0", width=130)
-        self.class_tree.column("target", width=150)
-        self.class_tree.column("power", width=95, anchor="e")
-        self.class_tree.column("files", width=400)
+        self.class_tree.column("#0", width=120)
+        self.class_tree.column("target", width=140)
+        self.class_tree.column("osc", width=140)
+        self.class_tree.column("power", width=80, anchor="e")
+        self.class_tree.column("files", width=300)
         self.class_tree.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(box, command=self.class_tree.yview)
         self.class_tree.configure(yscrollcommand=sb.set)
@@ -477,11 +659,11 @@ class App:
         ttk.Label(tab, text=t("merged_help"), foreground="#666", wraplength=940, justify="left").pack(anchor="w")
         box = ttk.Frame(tab)
         box.pack(fill="both", expand=True, pady=6)
-        cols = ("pos", "neg", "range", "value")
+        cols = ("pos", "neg", "range", "format", "value")
         self.merged_tree = ttk.Treeview(box, columns=cols, show="tree headings", selectmode="browse")
         self.merged_tree.heading("#0", text=t("col_name"))
-        for col, key, width in (("pos", "merged_pos", 150), ("neg", "merged_neg", 150), ("range", "merged_range", 170),
-                                ("value", "merged_value", 120)):
+        for col, key, width in (("pos", "merged_pos", 130), ("neg", "merged_neg", 130), ("range", "merged_range", 140),
+                                ("format", "merged_format", 150), ("value", "merged_value", 110)):
             self.merged_tree.heading(col, text=t(key))
             self.merged_tree.column(col, width=width, anchor="w" if col != "value" else "e")
         self.merged_tree.pack(side="left", fill="both", expand=True)
@@ -512,8 +694,12 @@ class App:
         for i, m in enumerate(self.cfg.merged_params):
             problems = merged_param_problems(m, names)
             value = t("merged_off") if not m.enabled else ("! " + problems[0] if problems else "")
+            fmt = t("fmt_" + m.osc_format) if m.osc_format in ("float", "binary", "both") else m.osc_format
+            if m.osc_format != "float":
+                fmt += " %d bit" % m.osc_bits
             self.merged_tree.insert("", "end", iid=str(i), text=m.name, values=(
-                m.positive or "-", m.negative or "-", "%g .. %g .. %g" % (m.out_min, m.neutral, m.out_max), value))
+                m.positive or "-", m.negative or "-", "%g .. %g .. %g" % (m.out_min, m.neutral, m.out_max), fmt,
+                value))
 
     def _update_merged_values(self):
         values = self.engine.last_merged
@@ -865,20 +1051,18 @@ class App:
         raw = self.engine.last_raw
         if raw is None:
             return
-        out = self.engine.last_out
-        for i, (cv, r_rect, s_rect, txt) in self.bars.items():
-            if i >= len(raw):
+        class_raw, final = self.engine.last_class_raw, self.engine.last_weights
+        for i, (cv, r_rect, s_rect, txt, _name, lo, hi) in self.bars.items():
+            if i >= len(raw) or i >= len(self.cfg.classes):
                 continue
             w = max(cv.winfo_width(), 1)
             c = self.cfg.classes[i]
-            r = float(raw[i])
-            cv.coords(r_rect, 0, 0, w * min(1.0, r / max(c.max_power, 1e-6)), 16)
-            if i in out:
-                cv.coords(s_rect, 0, 10, w * (out[i] + 1) / 2, 16)
-                txt.configure(text="%.3f → %+.2f" % (r, out[i]))
-            else:
-                cv.coords(s_rect, 0, 10, 0, 16)
-                txt.configure(text="%.3f" % r)
+            before, after = class_raw.get(i, 0.0), final.get(i, 0.0)
+            cv.coords(r_rect, 0, 0, w * before, 10)  # before the sensitivity range
+            cv.coords(s_rect, 0, 10, w * after, 16)  # what is sent
+            cv.coords(lo, w * c.in_min, 0, w * c.in_min, 16)
+            cv.coords(hi, w * c.in_max - 1, 0, w * c.in_max - 1, 16)
+            txt.configure(text="%.2f → %.2f" % (before, after))
 
     def _refresh_preview(self):
         if self.show_preview.get() and self.nb.index("current") == 0:
@@ -922,8 +1106,13 @@ class App:
     def refresh_classes(self):
         self.class_tree.delete(*self.class_tree.get_children())
         for i, c in enumerate(self.cfg.classes):
+            osc = ""
+            if c.osc_name:
+                osc = c.osc_name + ("" if c.osc_format == "float" else " (%s %d bit)" % (c.osc_format, c.osc_bits))
+                if class_output_problems(c):
+                    osc = "! " + osc
             self.class_tree.insert("", "end", iid=str(i), text=c.name,
-                                   values=(c.target or "", "%.4g" % c.max_power, ", ".join(c.files)))
+                                   values=(c.target or "", osc, "%.4g" % c.max_power, ", ".join(c.files)))
         self._rebuild_bars()
 
     def refresh_recordings(self):

@@ -773,16 +773,18 @@ class MergedParamTests(unittest.TestCase):
     def test_config_roundtrip_and_validation(self):
         from palbuddy.config import MergedParam
         cfg = Config(classes=[ExpressionClass("neutral"), ExpressionClass("smile"), ExpressionClass("sad")],
-                     merged_params=[MergedParam("SmileSad", "smile", "sad", 0.0, 2.0)])
+                     merged_params=[MergedParam("PBG_SmileSad", "smile", "sad", 0.0, 2.0)])
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "c.json")
             cfg.save(path)
             again = Config.load(path)
         self.assertEqual(again.merged_params[0], cfg.merged_params[0])
         self.assertEqual(again.validate(), [])
-        cfg.merged_params = [MergedParam("bad name", "smile", "nope", 1.0, 1.0), MergedParam("Empty")]
-        problems = cfg.validate()
+        self.assertEqual(again.output_problems(), [])
+        cfg.merged_params = [MergedParam("bad name", "smile", "nope", 1.0, 1.0), MergedParam("PBG_Empty")]
+        problems = cfg.output_problems()
         self.assertEqual(len(problems), 4, problems)
+        self.assertEqual(cfg.validate(), [])  # output problems never block training
 
     def test_engine_sends_merged_over_osc(self):
         from palbuddy.config import MergedParam
@@ -802,9 +804,9 @@ class MergedParamTests(unittest.TestCase):
         cfg = Config(face_port=0, eye_port=0, vrcft_port=0, osc_port=rx.getsockname()[1],
                      classes=[ExpressionClass("neutral"), ExpressionClass("smile", max_power=0.5),
                               ExpressionClass("sad", max_power=0.5)],
-                     merged_params=[MergedParam("SmileSad", "smile", "sad", -1.0, 1.0),
-                                    MergedParam("Mood02", "smile", "sad", 0.0, 2.0),
-                                    MergedParam("Off", "smile", None, enabled=False)])
+                     merged_params=[MergedParam("PBG_SmileSad", "smile", "sad", -1.0, 1.0),
+                                    MergedParam("PBG_Mood02", "smile", "sad", 0.0, 2.0),
+                                    MergedParam("PBG_Off", "smile", None, enabled=False)])
         engine = Engine(cfg).start()
         self.addCleanup(engine.stop)
         engine._make_runtime = lambda: FakeRuntime()
@@ -824,13 +826,13 @@ class MergedParamTests(unittest.TestCase):
 
         push = lambda: engine.hub.push(neural(1.0), neural(1.0))  # noqa: E731
         raw["value"] = np.array([0.9, 0.5, 0.0], np.float32)  # smile full (max_power 0.5)
-        self.assertTrue(wait_for(lambda: engine.last_merged.get("SmileSad") == 1.0 or push()))
+        self.assertTrue(wait_for(lambda: engine.last_merged.get("PBG_SmileSad") == 1.0 or push()))
         got = latest(push)
-        self.assertAlmostEqual(got["SmileSad"], 1.0, places=4)
-        self.assertAlmostEqual(got["Mood02"], 2.0, places=4)
-        self.assertNotIn("Off", got)
+        self.assertAlmostEqual(got["PBG_SmileSad"], 1.0, places=4)
+        self.assertAlmostEqual(got["PBG_Mood02"], 2.0, places=4)
+        self.assertNotIn("PBG_Off", got)
         raw["value"] = np.array([0.9, 0.0, 0.25], np.float32)  # half sad
-        self.assertTrue(wait_for(lambda: abs(engine.last_merged.get("SmileSad", 0) + 0.5) < 1e-6 or push()))
+        self.assertTrue(wait_for(lambda: abs(engine.last_merged.get("PBG_SmileSad", 0) + 0.5) < 1e-6 or push()))
         engine.stop_inference()  # leaves the parameters at neutral
         tail = []
         try:
@@ -839,8 +841,125 @@ class MergedParamTests(unittest.TestCase):
         except socket.timeout:
             pass
         final = dict((a.rsplit("/", 1)[1], v) for a, v in tail)
-        self.assertEqual(final["SmileSad"], 0.0)
-        self.assertEqual(final["Mood02"], 1.0)
+        self.assertEqual(final["PBG_SmileSad"], 0.0)
+        self.assertEqual(final["PBG_Mood02"], 1.0)
+
+
+def decode_osc_any(packet):
+    """-> (address, value) for a single float or bool OSC message."""
+    end = packet.index(b"\0")
+    address = packet[:end].decode()
+    i = (end + 4) & ~3
+    tag = packet[i:i + 2]
+    if tag == b",f":
+        return address, struct.unpack(">f", packet[i + 4:i + 8])[0]
+    assert tag in (b",T", b",F"), packet
+    return address, tag == b",T"
+
+
+class OscOutputTests(unittest.TestCase):
+    def test_every_vrcft_name_is_refused(self):
+        from palbuddy.vrcft_names import VRCFT_BINARY_PARAMETERS, VRCFT_PARAMETERS, vrcft_conflict
+        for n in VRCFT_PARAMETERS:
+            self.assertIsNotNone(vrcft_conflict(n), n)
+            self.assertIsNotNone(vrcft_conflict("Custom/" + n), n)  # VRCFT matches "/<name>" endings
+        for n in VRCFT_BINARY_PARAMETERS:
+            self.assertIsNotNone(vrcft_conflict(n + "4"), n)
+        self.assertIsNotNone(vrcft_conflict("jawopen"))  # case-insensitive, to be safe
+        for ok in ("PBG_SmileSad", "PBG/Happy", "MyFrown", "PBG_Mood2"):
+            self.assertIsNone(vrcft_conflict(ok), ok)
+
+    def test_output_names_and_problems(self):
+        from palbuddy.config import MergedParam, class_output_problems, merged_param_problems, osc_output_names
+        self.assertEqual(osc_output_names("X", "binary", 3, True), ["X1", "X2", "X4", "XNegative"])
+        self.assertEqual(osc_output_names("X", "both", 2, False), ["X", "X1", "X2"])
+        self.assertTrue(class_output_problems(ExpressionClass("a", osc_name="JawOpen")))
+        self.assertTrue(class_output_problems(ExpressionClass("a", osc_name="PBG/SmileSad")))
+        self.assertTrue(class_output_problems(ExpressionClass("a", osc_name="PBG_A", osc_format="binary", osc_bits=9)))
+        self.assertEqual(class_output_problems(ExpressionClass("a", osc_name="PBG_A", osc_format="binary")), [])
+        # a clash can come from a generated binary name only: "MouthX" + bit -> VRCFT binary MouthX<n>
+        self.assertTrue(merged_param_problems(MergedParam("Mouth", "a", None, 0, 1, True, "float"), {"a"}) == [])
+        self.assertTrue(merged_param_problems(MergedParam("SmileSad", "a"), {"a"}))
+        cfg = Config(classes=[ExpressionClass("a", osc_name="PBG_Dup")],
+                     merged_params=[MergedParam("PBG_Dup", "a")])
+        self.assertTrue(any("more than one output" in p for p in cfg.output_problems()))
+
+    def test_binary_matches_vrcft(self):
+        from palbuddy.config import binary_bits
+        # VRCFaceTracking BinaryBaseParameter: bit i of (int)(v * 2^N); v > 0.99999 -> all set
+        self.assertEqual(binary_bits(0.5, 4), [False, False, False, True])
+        self.assertEqual(binary_bits(0.26, 4), [False, False, True, False])
+        self.assertEqual(binary_bits(0.99, 4), [True] * 4)
+        self.assertEqual(binary_bits(1.0, 3), [True] * 3)
+        self.assertEqual(binary_bits(0.0, 5), [False] * 5)
+        self.assertEqual(binary_bits(-2, 2), [False, False])
+
+    def test_sensitivity_remap(self):
+        c = ExpressionClass("a", in_min=0.2, in_max=0.8)
+        self.assertEqual(c.remap(0.2), 0.0)
+        self.assertAlmostEqual(c.remap(0.5), 0.5)
+        self.assertEqual(c.remap(0.9), 1.0)
+        self.assertEqual(ExpressionClass("b").remap(0.37), 0.37)
+
+    def test_engine_sends_class_and_binary_outputs(self):
+        from palbuddy.config import MergedParam
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.bind(("127.0.0.1", 0))
+        rx.settimeout(0.5)
+        self.addCleanup(rx.close)
+        raw = {"value": np.array([0.9, 0.0, 0.0], np.float32)}
+
+        class FakeRuntime:
+            def activate(self): pass
+            def release(self): pass
+            def warmup(self): pass
+            def describe(self): return "fake"
+            def predict(self, sample): return raw["value"]
+
+        cfg = Config(face_port=0, eye_port=0, vrcft_port=0, osc_port=rx.getsockname()[1],
+                     classes=[ExpressionClass("neutral"),
+                              ExpressionClass("smile", max_power=1.0, in_min=0.2, in_max=0.8,
+                                              osc_name="PBG_Smile", osc_format="both", osc_bits=4),
+                              ExpressionClass("sad", max_power=1.0, osc_name="JawOpen")],  # refused: VRCFT name
+                     merged_params=[MergedParam("PBG_SS", "smile", "sad", -1, 1, True, "binary", 3),
+                                    MergedParam("PBG_Pos", "smile", "sad", 0, 2, True, "binary", 2)])
+        self.assertTrue(cfg.output_problems())  # the JawOpen output is reported...
+        engine = Engine(cfg).start()
+        self.addCleanup(engine.stop)
+        engine._make_runtime = lambda: FakeRuntime()
+        engine.start_inference()
+
+        def collect(seconds):
+            state, end = {}, time.time() + seconds
+            while time.time() < end:
+                engine.hub.push(neural(1.0), neural(1.0))
+                try:
+                    a, v = decode_osc_any(rx.recv(256))
+                    state[a.rsplit("/", 1)[1]] = v
+                except socket.timeout:
+                    pass
+            return state
+
+        raw["value"] = np.array([0.9, 0.6, 0.0], np.float32)  # smile 0.6 -> sensitivity -> 0.667
+        st = collect(1.5)
+        self.assertNotIn("JawOpen", st)  # ...and never sent
+        self.assertAlmostEqual(st["PBG_Smile"], 0.4 / 0.6, places=4)
+        self.assertEqual([st["PBG_Smile%d" % b] for b in (1, 2, 4, 8)], [False, True, False, True])  # int(10.67)=10
+        # merged -1..1 binary: sign + magnitude; 0..2 binary: position in range
+        self.assertEqual([st["PBG_SS%d" % b] for b in (1, 2, 4)], [True, False, True])  # int(0.667*8)=5
+        self.assertFalse(st["PBG_SSNegative"])
+        self.assertEqual([st["PBG_Pos%d" % b] for b in (1, 2)], [True, True])  # int(0.833*4)=3
+        raw["value"] = np.array([0.9, 0.0, 0.5], np.float32)  # sad 0.5 -> c = -0.5
+        st = collect(1.5)
+        self.assertTrue(st["PBG_SSNegative"])
+        self.assertEqual([st["PBG_SS%d" % b] for b in (1, 2, 4)], [False, False, True])  # int(0.5*8)=4
+        engine.stop_inference()
+        st = collect(0.8)
+        self.assertEqual(st["PBG_Smile"], 0.0)
+        self.assertEqual([st["PBG_Smile%d" % b] for b in (1, 2, 4, 8)], [False] * 4)
+        self.assertEqual([st["PBG_SS%d" % b] for b in (1, 2, 4)], [False] * 3)
+        self.assertFalse(st["PBG_SSNegative"])
+        self.assertEqual([st["PBG_Pos%d" % b] for b in (1, 2)], [False, True])  # neutral = middle (0.5 -> 2)
 
 
 class ConfigTests(unittest.TestCase):

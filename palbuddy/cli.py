@@ -25,8 +25,11 @@ HELP = """commands:
   arch [standard|lite]  model size used for the next training
   vrcft [status|install|uninstall]  VRCFaceTracking v6 module
   merged                             list merged parameters (sent to VRChat over OSC)
-  merged add NAME POS NEG [MIN MAX]  e.g. "merged add SmileSad smile sad -1 1" (use - for no class)
+  merged add NAME POS NEG [MIN MAX [FORMAT BITS]]
+                                     e.g. "merged add PBG_SmileSad smile sad -1 1 binary 4" (- = no class)
   merged remove NAME
+  oscout CLASS OSCNAME [float|binary|both] [BITS]   send a class straight to VRChat (OSCNAME - = off)
+  sens CLASS LOW HIGH                sensitivity: stretch LOW..HIGH of the class to 0..1
   perf [engine auto|onnx|pytorch] [device auto|cpu|gpu] [threads N] [int8 on|off] [rate HZ]
        [priority above_normal|normal|below_normal|idle] [affinity all|ecores] [eco on|off]
                      show / change inference performance settings
@@ -144,10 +147,11 @@ def run_cli(engine):
                 from .config import MergedParam, merged_param_problems
                 c = engine.cfg
                 words = arg.split()
-                if words[:1] == ["add"] and len(words) in (4, 6):
-                    lo, hi = (float(words[4]), float(words[5])) if len(words) == 6 else (-1.0, 1.0)
+                if words[:1] == ["add"] and len(words) in (4, 6, 8):
+                    lo, hi = (float(words[4]), float(words[5])) if len(words) >= 6 else (-1.0, 1.0)
+                    fmt, bits = (words[6], int(words[7])) if len(words) == 8 else ("float", 4)
                     m = MergedParam(words[1], None if words[2] == "-" else words[2],
-                                    None if words[3] == "-" else words[3], lo, hi)
+                                    None if words[3] == "-" else words[3], lo, hi, True, fmt, bits)
                     problems = merged_param_problems(m, {x.name for x in c.classes})
                     if any(p.name == m.name for p in c.merged_params):
                         problems.append("'%s' already exists" % m.name)
@@ -159,13 +163,38 @@ def run_cli(engine):
                     c.merged_params = [m for m in c.merged_params if m.name != words[1]]
                     engine.save_config()
                 elif words:
-                    raise ValueError("usage: merged | merged add NAME POS NEG [MIN MAX] | merged remove NAME")
+                    raise ValueError("usage: merged | merged add NAME POS NEG [MIN MAX [FORMAT BITS]] | "
+                                     "merged remove NAME")
                 for m in c.merged_params:
                     print("  %-16s + %-12s - %-12s  %g .. %g .. %g%s  now %s" % (
                         m.name, m.positive or "-", m.negative or "-", m.out_min, m.neutral, m.out_max,
                         "" if m.enabled else " (off)", "%.3f" % engine.last_merged[m.name]
                         if m.name in engine.last_merged else "-"))
                 print("  OSC %s -> %s:%d" % ("on" if c.osc_enabled else "off", c.osc_host, c.osc_port))
+            elif cmd in ("oscout", "sens"):
+                from .config import class_output_problems
+                words = arg.split()
+                cls = next((c for c in engine.cfg.classes if words and c.name == words[0]), None)
+                if cls is None:
+                    raise ValueError("unknown class; classes: %s" % ", ".join(c.name for c in engine.cfg.classes))
+                if cmd == "sens":
+                    lo, hi = float(words[1]), float(words[2])
+                    if not 0 <= lo < hi <= 1:
+                        raise ValueError("need 0 <= LOW < HIGH <= 1")
+                    cls.in_min, cls.in_max = lo, hi
+                else:
+                    old = (cls.osc_name, cls.osc_format, cls.osc_bits)
+                    cls.osc_name = None if words[1] == "-" else words[1]
+                    cls.osc_format = words[2] if len(words) > 2 else "float"
+                    cls.osc_bits = int(words[3]) if len(words) > 3 else 4
+                    problems = class_output_problems(cls)
+                    if problems:
+                        cls.osc_name, cls.osc_format, cls.osc_bits = old
+                        raise ValueError("; ".join(problems))
+                engine.save_config()
+                print("%s: sensitivity %.2f..%.2f, OSC %s" % (cls.name, cls.in_min, cls.in_max, cls.osc_name and
+                      "%s (%s%s)" % (cls.osc_name, cls.osc_format, "" if cls.osc_format == "float"
+                                     else " %d bit" % cls.osc_bits) or "-"))
             elif cmd == "arch":
                 if arg:
                     if arg not in ("standard", "lite"):
