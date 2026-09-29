@@ -12,17 +12,28 @@ It now comes with a GUI, and one process handles receiving data, recording, trai
 
 # Installation
 1. Replace the tvm runtime inside SRanipal. Copy the two .DLL files from the `tvm runtime` folder into `C:\Program Files\VIVE\SRanipal`, replacing the existing files. Back up the old files first in case you want to revert.
-2. Install PyTorch with GPU support. Follow https://pytorch.org/get-started/locally/ (pip or conda).
-3. `pip install -r requirements.txt`
+2. **Double-click `PalBuddyGuy.bat`.** That's it.
+
+On the first run the launcher:
+* finds Python 3.9+, or offers to install it with winget,
+* creates a private environment in `.venv`, so your system Python is left untouched,
+* installs PyTorch (the CUDA build when an NVIDIA GPU is detected, otherwise the CPU build) and the other packages. This is a 2–3 GB download and takes a few minutes,
+* offers to create a **Pal Buddy Guy** shortcut on the desktop.
+
+After that, double-clicking the .bat or the shortcut opens the GUI directly, without a console window. Startup errors (such as a port already in use) appear in a dialog, and everything is logged to `palbuddy.log`. To reinstall from scratch, delete the `.venv` folder and run the .bat again.
 
 # Running
-Start Pal Buddy Guy **before** SRanipalRuntime:
+Start Pal Buddy Guy (double-click) **before** SRanipalRuntime.
+
+Manual / advanced use, with your own Python environment:
 
 ```
+pip install -r requirements.txt   # install a GPU build of torch first: https://pytorch.org/get-started/locally/
 python -m palbuddy          # GUI  (same as: python script.py)
 python -m palbuddy --cli    # text commands, like the old script
-python -m palbuddy --infer  # start tracking right away (e.g. from a shortcut)
+python -m palbuddy --infer  # start tracking right away
 ```
+Arguments given to the .bat are passed on as well, for example `PalBuddyGuy.bat --infer`.
 
 You no longer need to start `tvm_proxy.py` separately, because the app receives the SRanipal streams itself. See *Legacy proxy mode* below if you still want a separate proxy.
 
@@ -80,8 +91,8 @@ If you want the receiver in its own process, run `python tvm_proxy.py` and set t
 
 # 한국어 빠른 시작
 1. `tvm runtime` 폴더의 DLL 두 개를 `C:\Program Files\VIVE\SRanipal`에 덮어씁니다 (원본은 백업해 두세요).
-2. GPU 지원 PyTorch를 설치하고 `pip install -r requirements.txt`를 실행합니다.
-3. **SRanipalRuntime보다 먼저** `python -m palbuddy`를 실행합니다. 이제 `tvm_proxy.py`는 따로 실행할 필요가 없습니다.
+2. **`PalBuddyGuy.bat`을 더블클릭합니다.** 처음 실행할 때는 Python(없으면 winget으로 설치할지 묻습니다), PyTorch(NVIDIA GPU가 있으면 CUDA 버전)와 나머지 패키지를 `.venv` 폴더에 자동으로 설치하고, 바탕화면 바로가기를 만들지 묻습니다. 다운로드가 약 2~3GB라 몇 분 걸립니다. 그다음부터는 더블클릭하면 콘솔 창 없이 바로 GUI가 뜹니다. 다시 설치하려면 `.venv` 폴더를 지우고 다시 실행하세요.
+3. **SRanipalRuntime보다 먼저** 실행해야 합니다. 이제 `tvm_proxy.py`는 따로 실행할 필요가 없습니다.
 4. **실시간** 탭: 위에 눈, 아래에 얼굴이 보이는지 확인합니다. 반대로 보이면 *눈/얼굴 뒤바꾸기*를 누르세요.
 5. **녹화** 탭: 이름을 입력하고 녹화합니다 (약 30초, 파일 하나에 약 400MB). `neutral`(무표정) 녹화는 반드시 있어야 합니다.
 6. **학습** 탭: 클래스별로 녹화 파일과 대상 파라미터를 지정합니다 (첫 번째 클래스는 neutral). *학습 시작*을 누르고, 손실이 0.001 아래로 내려가면 *모델 저장*을 누릅니다.

@@ -11,7 +11,9 @@ from typing import List, Optional
 
 from .params import shape_id
 
-DEFAULT_CONFIG_PATH = os.path.join(os.getcwd(), "config.json")
+# config.json lives next to script.py / PalBuddyGuy.bat, independent of the working directory
+APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
 
 @dataclass

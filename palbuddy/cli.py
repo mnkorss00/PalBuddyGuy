@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import os
 import sys
 import threading
 import time
@@ -103,6 +104,37 @@ def run_cli(engine):
     engine.stop()
 
 
+def show_fatal(message):
+    """Without a console (double-clicked launcher, pythonw) errors would be invisible."""
+    try:
+        import tkinter
+        from tkinter import messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showerror("Pal Buddy Guy", message)
+        root.destroy()
+    except Exception:
+        pass
+
+
+def setup_logging(verbose, config_path):
+    level = logging.DEBUG if verbose else logging.INFO
+    fmt = logging.Formatter("%(asctime)s %(levelname).1s %(message)s", "%H:%M:%S")
+    root = logging.getLogger()
+    root.setLevel(level)
+    if sys.stderr is not None:  # None under pythonw
+        h = logging.StreamHandler()
+        h.setFormatter(fmt)
+        root.addHandler(h)
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(config_path)), "palbuddy.log")
+        h = logging.FileHandler(path, mode="w", encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname).1s %(name)s: %(message)s"))
+        root.addHandler(h)
+    except OSError:
+        pass
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="palbuddy", description="Vive Pro Eye / facial tracker expression trainer")
     p.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="path to config.json")
@@ -110,19 +142,41 @@ def main(argv=None):
     p.add_argument("--infer", action="store_true", help="start tracking immediately (headless use)")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args(argv)
+    args.config = os.path.abspath(args.config)
+    # relative paths in the config (datasets/, buddyguy.pt) are relative to the config file,
+    # no matter where the app was started from (double-click, shortcut, terminal)
+    os.chdir(os.path.dirname(args.config))
 
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname).1s %(message)s", datefmt="%H:%M:%S")
-    cfg = Config.load(args.config)
+    setup_logging(args.verbose, args.config)
+    gui = not args.cli
+    try:
+        cfg = Config.load(args.config)
+    except Exception as e:
+        log.exception("config error")
+        msg = "Could not read %s:\n%s" % (args.config, e)
+        if gui:
+            show_fatal(msg)
+        return 1
     for problem in cfg.validate():
         log.warning(problem)
 
-    from .engine import Engine  # imports torch; keep --help fast
+    try:
+        from .engine import Engine  # imports torch; keep --help fast
+    except ImportError as e:
+        msg = "PyTorch is not installed (%s).\nRun PalBuddyGuy.bat again, or delete the .venv folder to reinstall." % e
+        log.error(msg)
+        if gui:
+            show_fatal(msg)
+        return 1
     engine = Engine(cfg, args.config)
     try:
         engine.start()
     except OSError as e:
-        log.error("Could not open a port (%s). Is another copy of the script or tvm_proxy.py running?", e)
+        msg = ("Could not open a network port (%s).\n"
+               "Is Pal Buddy Guy or tvm_proxy.py already running?" % e)
+        log.error(msg)
+        if gui:
+            show_fatal(msg)
         return 1
     if args.infer:
         try:
@@ -130,16 +184,24 @@ def main(argv=None):
         except Exception as e:
             log.error("Can't start tracking: %s", e)
 
-    if args.cli:
+    if not gui:
         run_cli(engine)
         return 0
     try:
         from .gui import run_gui
     except ImportError as e:
         log.error("GUI unavailable (%s); falling back to --cli", e)
+        if sys.stdin is None:
+            return 1
         run_cli(engine)
         return 0
-    run_gui(engine)
+    try:
+        run_gui(engine)
+    except Exception as e:
+        log.exception("GUI crashed")
+        engine.stop()
+        show_fatal("Unexpected error: %s\nSee palbuddy.log for details." % e)
+        return 1
     return 0
 
 

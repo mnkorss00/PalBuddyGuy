@@ -7,3 +7,5 @@ datasets/
 *.mmap
 *.mmap.part
 *.pkl
+.venv/
+palbuddy.log
