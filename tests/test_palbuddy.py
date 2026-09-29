@@ -753,27 +753,27 @@ class MergedParamTests(unittest.TestCase):
 
     def test_combine_ranges(self):
         from palbuddy.config import MergedParam
-        m = MergedParam("SmileSad", "smile", "sad", -1.0, 1.0)
+        m = MergedParam.pair("SmileSad", "smile", "sad", -1.0, 1.0)
         self.assertEqual(m.combine({"smile": 1.0, "sad": 0.0}), 1.0)
         self.assertEqual(m.combine({"smile": 0.0, "sad": 1.0}), -1.0)
         self.assertEqual(m.combine({"smile": 0.0, "sad": 0.0}), 0.0)
         self.assertAlmostEqual(m.combine({"smile": 0.3, "sad": 0.1}), 0.2)
-        two = MergedParam("SmileSad", "smile", "sad", 0.0, 2.0)
+        two = MergedParam.pair("SmileSad", "smile", "sad", 0.0, 2.0)
         self.assertEqual(two.combine({"smile": 0.0, "sad": 1.0}), 0.0)
         self.assertEqual(two.combine({}), 1.0)
         self.assertEqual(two.combine({"smile": 0.5}), 1.5)
         self.assertEqual(two.neutral, 1.0)
         self.assertTrue(two.beyond_sync_range)
-        half = MergedParam("X", "smile", None, 0.0, 1.0)
+        half = MergedParam.pair("X", "smile", None, 0.0, 1.0)
         self.assertEqual(half.combine({"smile": 1.0}), 1.0)
         self.assertEqual(half.combine({"smile": 0.0}), 0.5)
-        flipped = MergedParam("X", "smile", "sad", 1.0, -1.0)  # reversed range is allowed
+        flipped = MergedParam.pair("X", "smile", "sad", 1.0, -1.0)  # reversed range is allowed
         self.assertEqual(flipped.combine({"smile": 1.0}), -1.0)
 
     def test_config_roundtrip_and_validation(self):
         from palbuddy.config import MergedParam
         cfg = Config(classes=[ExpressionClass("neutral"), ExpressionClass("smile"), ExpressionClass("sad")],
-                     merged_params=[MergedParam("PBG_SmileSad", "smile", "sad", 0.0, 2.0)])
+                     merged_params=[MergedParam.pair("PBG_SmileSad", "smile", "sad", 0.0, 2.0)])
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "c.json")
             cfg.save(path)
@@ -781,7 +781,7 @@ class MergedParamTests(unittest.TestCase):
         self.assertEqual(again.merged_params[0], cfg.merged_params[0])
         self.assertEqual(again.validate(), [])
         self.assertEqual(again.output_problems(), [])
-        cfg.merged_params = [MergedParam("bad name", "smile", "nope", 1.0, 1.0), MergedParam("PBG_Empty")]
+        cfg.merged_params = [MergedParam.pair("bad name", "smile", "nope", 1.0, 1.0), MergedParam("PBG_Empty")]
         problems = cfg.output_problems()
         self.assertEqual(len(problems), 4, problems)
         self.assertEqual(cfg.validate(), [])  # output problems never block training
@@ -804,9 +804,9 @@ class MergedParamTests(unittest.TestCase):
         cfg = Config(face_port=0, eye_port=0, vrcft_port=0, osc_port=rx.getsockname()[1],
                      classes=[ExpressionClass("neutral"), ExpressionClass("smile", max_power=0.5),
                               ExpressionClass("sad", max_power=0.5)],
-                     merged_params=[MergedParam("PBG_SmileSad", "smile", "sad", -1.0, 1.0),
-                                    MergedParam("PBG_Mood02", "smile", "sad", 0.0, 2.0),
-                                    MergedParam("PBG_Off", "smile", None, enabled=False)])
+                     merged_params=[MergedParam.pair("PBG_SmileSad", "smile", "sad", -1.0, 1.0),
+                                    MergedParam.pair("PBG_Mood02", "smile", "sad", 0.0, 2.0),
+                                    MergedParam.pair("PBG_Off", "smile", None, enabled=False)])
         engine = Engine(cfg).start()
         self.addCleanup(engine.stop)
         engine._make_runtime = lambda: FakeRuntime()
@@ -857,6 +857,58 @@ def decode_osc_any(packet):
     return address, tag == b",T"
 
 
+class MultiTermMergedTests(unittest.TestCase):
+    def test_weighted_sum_and_neutral(self):
+        from palbuddy.config import MergedParam, parse_terms
+        # EyeLidExpandedSqueeze-like: 0.2*wide + 0.8*open - squeeze
+        m = MergedParam("PBG_Lid", parse_terms("0.2*wide,0.8*open,-squeeze"), 0.0, 1.0)
+        self.assertAlmostEqual(m.combined({"wide": 1, "open": 1}), 1.0)
+        self.assertAlmostEqual(m.combined({"open": 1, "squeeze": 0.3}), 0.5)
+        self.assertEqual(m.combined({"squeeze": 1}), -1.0)
+        self.assertEqual(m.combined({"wide": 1, "open": 1, "squeeze": 0}), 1.0)
+        self.assertEqual(m.combined({"wide": 5, "open": 5}), 1.0)  # clamped
+        # custom neutral: -1 -> min, 0 -> neutral, +1 -> max (piecewise linear)
+        n = MergedParam("PBG_N", parse_terms("smile,-sad"), 0.0, 1.0, 0.2)
+        self.assertEqual(n.combine({}), 0.2)
+        self.assertAlmostEqual(n.combine({"smile": 0.5}), 0.6)
+        self.assertAlmostEqual(n.combine({"sad": 0.5}), 0.1)
+        self.assertEqual(n.combine({"smile": 1}), 1.0)
+        self.assertEqual(n.combine({"sad": 1}), 0.0)
+        self.assertEqual(MergedParam.pair("PBG_M", "a", "b", 0, 2).neutral, 1.0)
+
+    def test_binary_follows_the_output_value(self):
+        from palbuddy.config import MergedParam, parse_terms
+        m = MergedParam("PBG_S", parse_terms("smile,-sad"), -1.0, 1.0, 0.0)
+        self.assertEqual(m.binary_input({"smile": 0.5}), (0.5, False))
+        self.assertEqual(m.binary_input({"sad": 0.5}), (0.5, True))
+        u = MergedParam("PBG_U", parse_terms("smile,-sad"), 0.0, 2.0, 0.5)
+        self.assertEqual(u.binary_input({}), (0.25, False))  # neutral 0.5 of 0..2
+        self.assertEqual(u.binary_input({"smile": 1}), (1.0, False))
+
+    def test_parse_formula_and_validation(self):
+        from palbuddy.config import MergedParam, merged_param_problems, parse_terms
+        terms = parse_terms("smile, -sad, 0.2*wide, -0.5*squeeze")
+        self.assertEqual([(t.cls, t.weight) for t in terms],
+                         [("smile", 1.0), ("sad", -1.0), ("wide", 0.2), ("squeeze", -0.5)])
+        self.assertEqual(MergedParam("X", terms).formula(), "smile - sad + 0.2*wide - 0.5*squeeze")
+        names = {"smile", "sad", "wide", "squeeze"}
+        self.assertEqual(merged_param_problems(MergedParam("PBG_X", terms), names), [])
+        self.assertTrue(merged_param_problems(MergedParam("PBG_X", parse_terms("smile"), 0, 1, 2.0), names))  # neutral
+        self.assertTrue(merged_param_problems(MergedParam("PBG_X", parse_terms("20*smile")), names))  # weight
+        self.assertTrue(merged_param_problems(MergedParam("PBG_X", parse_terms("0*smile")), names))  # all zero
+
+    def test_old_positive_negative_config_still_loads(self):
+        cfg = Config.from_dict({"classes": [{"name": "smile"}, {"name": "sad"}], "merged_params": [
+            {"name": "PBG_Old", "positive": "smile", "negative": "sad", "out_min": 0.0, "out_max": 2.0}]})
+        m = cfg.merged_params[0]
+        self.assertEqual([(t.cls, t.weight) for t in m.terms], [("smile", 1.0), ("sad", -1.0)])
+        self.assertEqual(m.combine({"smile": 1}), 2.0)
+        with tempfile.TemporaryDirectory() as d:  # and round-trips in the new form
+            path = os.path.join(d, "c.json")
+            cfg.save(path)
+            self.assertEqual(Config.load(path).merged_params[0], m)
+
+
 class OscOutputTests(unittest.TestCase):
     def test_every_vrcft_name_is_refused(self):
         from palbuddy.vrcft_names import VRCFT_BINARY_PARAMETERS, VRCFT_PARAMETERS, vrcft_conflict
@@ -878,10 +930,10 @@ class OscOutputTests(unittest.TestCase):
         self.assertTrue(class_output_problems(ExpressionClass("a", osc_name="PBG_A", osc_format="binary", osc_bits=9)))
         self.assertEqual(class_output_problems(ExpressionClass("a", osc_name="PBG_A", osc_format="binary")), [])
         # a clash can come from a generated binary name only: "MouthX" + bit -> VRCFT binary MouthX<n>
-        self.assertTrue(merged_param_problems(MergedParam("Mouth", "a", None, 0, 1, True, "float"), {"a"}) == [])
-        self.assertTrue(merged_param_problems(MergedParam("SmileSad", "a"), {"a"}))
+        self.assertTrue(merged_param_problems(MergedParam.pair("Mouth", "a", None, 0, 1, osc_format="float"), {"a"}) == [])
+        self.assertTrue(merged_param_problems(MergedParam.pair("SmileSad", "a"), {"a"}))
         cfg = Config(classes=[ExpressionClass("a", osc_name="PBG_Dup")],
-                     merged_params=[MergedParam("PBG_Dup", "a")])
+                     merged_params=[MergedParam.pair("PBG_Dup", "a")])
         self.assertTrue(any("more than one output" in p for p in cfg.output_problems()))
 
     def test_binary_matches_vrcft(self):
@@ -921,8 +973,8 @@ class OscOutputTests(unittest.TestCase):
                               ExpressionClass("smile", max_power=1.0, in_min=0.2, in_max=0.8,
                                               osc_name="PBG_Smile", osc_format="both", osc_bits=4),
                               ExpressionClass("sad", max_power=1.0, osc_name="JawOpen")],  # refused: VRCFT name
-                     merged_params=[MergedParam("PBG_SS", "smile", "sad", -1, 1, True, "binary", 3),
-                                    MergedParam("PBG_Pos", "smile", "sad", 0, 2, True, "binary", 2)])
+                     merged_params=[MergedParam.pair("PBG_SS", "smile", "sad", -1, 1, osc_format="binary", osc_bits=3),
+                                    MergedParam.pair("PBG_Pos", "smile", "sad", 0, 2, osc_format="binary", osc_bits=2)])
         self.assertTrue(cfg.output_problems())  # the JawOpen output is reported...
         engine = Engine(cfg).start()
         self.addCleanup(engine.stop)

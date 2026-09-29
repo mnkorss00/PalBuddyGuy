@@ -74,17 +74,26 @@ STRINGS = {
     "binary_unsigned": ("Binary: position within the range (min end = 0, max end = 1).",
                         "바이너리: 범위 안의 위치 (min 쪽 = 0, max 쪽 = 1)."),
     "merged_format": ("Format", "형식"),
-    "merged_help": ("Combine two trained classes into one custom avatar parameter, sent to VRChat over OSC: "
-                    "value = positive class - negative class (e.g. smile - sad), mapped to the range you pick "
-                    "(-1..1, 0..1, 0..2 or custom), as a float and/or binary bools. Add parameters with the same "
+    "merged_terms": ("Classes × weight", "클래스 × 가중치"),
+    "merged_add_term": ("+ Add class", "+ 클래스 추가"),
+    "merged_terms_hint": ("combined = sum of class × weight, limited to -1..1 (0 when all are 0). Use negative "
+                          "weights for classes that pull the other way, e.g. smile × 1, sad × -1, or "
+                          "wide × 0.2, open × 0.8, squeeze × -1.",
+                          "결합값 = 클래스 × 가중치의 합, -1~1로 제한 (모두 0이면 0). 반대 방향 클래스는 음수 가중치를 쓰세요. "
+                          "예: 웃음 × 1, 슬픔 × -1 또는 넓힘 × 0.2, 뜸 × 0.8, 찡그림 × -1."),
+    "merged_neutral": ("neutral", "중간값"),
+    "merged_preview2": ("%s\ncombined -1 → %g,  0 (all classes 0) → %g,  +1 → %g",
+                        "%s\n결합값 -1 → %g,  0 (모든 클래스 0) → %g,  +1 → %g"),
+    "merged_bad_number": ("Weights, min, neutral and max must be numbers.", "가중치, min, 중간값, max는 숫자여야 합니다."),
+    "merged_help": ("Combine two or more trained classes into one custom avatar parameter, sent to VRChat over OSC: "
+                    "combined = sum of class × weight (e.g. smile × 1 + sad × -1), mapped to the range you pick "
+                    "with your own neutral value, as a float and/or binary bools. Add parameters with the same "
                     "name to your avatar (e.g. PBG_SmileSad). Names VRCFaceTracking uses are refused.",
-                    "학습된 두 클래스를 하나의 아바타 파라미터로 합쳐 OSC로 VRChat에 보냅니다: "
-                    "값 = 긍정 클래스 − 부정 클래스 (예: 웃음 − 슬픔), 고른 범위(-1~1, 0~1, 0~2, 직접 입력)로 변환해 "
+                    "학습된 두 개 이상의 클래스를 하나의 아바타 파라미터로 합쳐 OSC로 VRChat에 보냅니다: "
+                    "결합값 = 클래스 × 가중치의 합 (예: 웃음 × 1 + 슬픔 × -1)을 고른 범위와 직접 정한 중간값으로 변환해 "
                     "float 및/또는 바이너리로 보냅니다. 아바타에 같은 이름의 파라미터를 추가하세요 (예: PBG_SmileSad). "
                     "VRCFaceTracking이 쓰는 이름은 사용할 수 없습니다."),
     "merged_dialog": ("Merged parameter", "병합 파라미터"),
-    "merged_pos": ("Positive class (+)", "긍정 클래스 (+)"),
-    "merged_neg": ("Negative class (-)", "부정 클래스 (-)"),
     "merged_range": ("Range", "범위"),
     "merged_value": ("Value", "현재 값"),
     "merged_enabled": ("Enabled", "사용"),
@@ -93,7 +102,6 @@ STRINGS = {
     "range_0_1": ("0 ~ 1 (neutral 0.5)", "0 ~ 1 (중앙 0.5)"),
     "range_0_2": ("0 ~ 2 (neutral 1)", "0 ~ 2 (중앙 1)"),
     "range_custom": ("custom", "직접 입력"),
-    "merged_preview": ("%s → %g,  neither → %g,  %s → %g", "%s → %g,  둘 다 아님 → %g,  %s → %g"),
     "merged_sync_warning": ("VRChat syncs float parameters in -1..1; values outside only work locally "
                             "(unsynced parameter). Otherwise use -1..1 and rescale in the animator.",
                             "VRChat은 float 파라미터를 -1~1 범위로 동기화합니다. 이 범위를 벗어나는 값은 로컬(동기화 안 함) "

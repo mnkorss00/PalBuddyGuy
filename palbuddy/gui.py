@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
-from .config import (MAX_BINARY_BITS, OSC_FORMATS, RANGE_PRESETS, ExpressionClass, MergedParam,
+from .config import (MAX_BINARY_BITS, OSC_FORMATS, RANGE_PRESETS, ExpressionClass, MergedParam, MergedTerm,
                      class_output_problems, merged_param_problems)
 from .datasets import frame_count
 from .engine import dataset_files
@@ -172,7 +172,9 @@ class ClassDialog(tk.Toplevel):
 
 
 class MergedDialog(tk.Toplevel):
-    """Edit one merged parameter: name, positive/negative class, output range."""
+    """Edit one merged parameter: name, weighted classes, output range with neutral point."""
+
+    MAX_TERMS = 8
 
     def __init__(self, app, param=None):
         super().__init__(app.root)
@@ -181,57 +183,88 @@ class MergedDialog(tk.Toplevel):
         self.title(t("merged_dialog"))
         self.transient(app.root)
         self.result = None
-        param = param or MergedParam("", None, None, -1.0, 1.0, True)
-        classes = [t("none")] + [c.name for c in app.cfg.classes]
-        self.none_label = t("none")
+        param = param or MergedParam("", [MergedTerm(app.cfg.classes[1].name if len(app.cfg.classes) > 1 else "", 1.0)])
+        self.class_names = [c.name for c in app.cfg.classes]
 
         frm = ttk.Frame(self, padding=10)
         frm.pack(fill="both", expand=True)
         self.name = tk.StringVar(value=param.name)
-        self.pos = tk.StringVar(value=param.positive or self.none_label)
-        self.neg = tk.StringVar(value=param.negative or self.none_label)
+        ttk.Label(frm, text=t("col_name")).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(frm, textvariable=self.name, width=28).grid(row=0, column=1, columnspan=5, sticky="w", pady=2)
+
+        ttk.Label(frm, text=t("merged_terms")).grid(row=1, column=0, sticky="nw", pady=(6, 2))
+        self.terms_frame = ttk.Frame(frm)
+        self.terms_frame.grid(row=1, column=1, columnspan=5, sticky="w", pady=(6, 2))
+        self.term_rows = []  # (class var, weight var, row frame)
+        for term in param.terms:
+            self._add_term_row(term.cls, term.weight)
+        self.add_term_btn = ttk.Button(frm, text=t("merged_add_term"), command=lambda: self._add_term_row("", 1.0))
+        self.add_term_btn.grid(row=2, column=1, sticky="w")
+        ttk.Label(frm, text=t("merged_terms_hint"), foreground="#666", wraplength=420, justify="left").grid(
+            row=3, column=0, columnspan=6, sticky="w", pady=(2, 6))
+
         self.min = tk.StringVar(value="%g" % param.out_min)
+        self.mid = tk.StringVar(value="%g" % param.neutral)
         self.max = tk.StringVar(value="%g" % param.out_max)
         self.enabled = tk.BooleanVar(value=param.enabled)
         self.preset_labels = {k: t("range_" + k.replace("..", "_").replace("-", "m")) for k in RANGE_PRESETS}
         self.preset_labels["custom"] = t("range_custom")
         current = next((k for k, v in RANGE_PRESETS.items() if v == (param.out_min, param.out_max)), "custom")
         self.preset = tk.StringVar(value=self.preset_labels[current])
-
-        rows = ((t("col_name"), ttk.Entry(frm, textvariable=self.name, width=28)),
-                (t("merged_pos"), ttk.Combobox(frm, textvariable=self.pos, values=classes, state="readonly", width=26)),
-                (t("merged_neg"), ttk.Combobox(frm, textvariable=self.neg, values=classes, state="readonly", width=26)))
-        for i, (label, widget) in enumerate(rows):
-            ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=2)
-            widget.grid(row=i, column=1, columnspan=3, sticky="w", pady=2)
-        ttk.Label(frm, text=t("merged_range")).grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Label(frm, text=t("merged_range")).grid(row=4, column=0, sticky="w", pady=2)
         preset_box = ttk.Combobox(frm, textvariable=self.preset, values=list(self.preset_labels.values()),
                                   state="readonly", width=26)
-        preset_box.grid(row=3, column=1, columnspan=3, sticky="w")
+        preset_box.grid(row=4, column=1, columnspan=5, sticky="w")
         preset_box.bind("<<ComboboxSelected>>", lambda e: self._apply_preset())
-        ttk.Label(frm, text="min").grid(row=4, column=0, sticky="e")
-        self.min_entry = ttk.Entry(frm, textvariable=self.min, width=8)
-        self.min_entry.grid(row=4, column=1, sticky="w")
-        ttk.Label(frm, text="max").grid(row=4, column=2, sticky="e")
-        self.max_entry = ttk.Entry(frm, textvariable=self.max, width=8)
-        self.max_entry.grid(row=4, column=3, sticky="w")
+        entries = {}
+        for col, (label, var) in enumerate((("min", self.min), (t("merged_neutral"), self.mid), ("max", self.max))):
+            ttk.Label(frm, text=label).grid(row=5, column=col * 2, sticky="e", padx=(0, 4))
+            entries[label] = ttk.Entry(frm, textvariable=var, width=8)
+            entries[label].grid(row=5, column=col * 2 + 1, sticky="w")
+        self.min_entry, self.max_entry = entries["min"], entries["max"]
         self.osc_format = tk.StringVar(value=param.osc_format)
         self.osc_bits = tk.IntVar(value=param.osc_bits)
-        format_row(frm, 5, app, self.osc_format, self.osc_bits)
+        fmt = ttk.Frame(frm)
+        fmt.grid(row=6, column=0, columnspan=6, sticky="w")
+        format_row(fmt, 0, app, self.osc_format, self.osc_bits)
         ttk.Checkbutton(frm, text=t("merged_enabled"), variable=self.enabled).grid(
-            row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        self.preview = ttk.Label(frm, text="", foreground="#666", wraplength=380, justify="left")
-        self.preview.grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        for var in (self.pos, self.neg, self.min, self.max, self.osc_format):
+            row=7, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        self.preview = ttk.Label(frm, text="", foreground="#666", wraplength=440, justify="left")
+        self.preview.grid(row=8, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        for var in (self.min, self.mid, self.max, self.osc_format):
             var.trace_add("write", lambda *a: self._update_preview())
         btns = ttk.Frame(frm)
-        btns.grid(row=8, column=0, columnspan=4, sticky="e", pady=(8, 0))
+        btns.grid(row=9, column=0, columnspan=6, sticky="e", pady=(8, 0))
         ttk.Button(btns, text="OK", command=self.ok).pack(side="left", padx=4)
         ttk.Button(btns, text=t("cancel"), command=self.destroy).pack(side="left")
         self._apply_preset(initial=True)
         self.grab_set()
         self.wait_window()
 
+    # -------------------------------------------------------------- terms
+    def _add_term_row(self, cls, weight):
+        if len(self.term_rows) >= self.MAX_TERMS:
+            return
+        row = ttk.Frame(self.terms_frame)
+        row.pack(anchor="w", pady=1)
+        cls_var, w_var = tk.StringVar(value=cls), tk.StringVar(value="%g" % weight)
+        ttk.Combobox(row, textvariable=cls_var, values=self.class_names, state="readonly", width=16).pack(side="left")
+        ttk.Label(row, text=" × ").pack(side="left")
+        ttk.Entry(row, textvariable=w_var, width=6).pack(side="left")
+        entry = (cls_var, w_var, row)
+        ttk.Button(row, text="−", width=3, command=lambda: self._remove_term_row(entry)).pack(side="left", padx=4)
+        self.term_rows.append(entry)
+        for var in (cls_var, w_var):
+            var.trace_add("write", lambda *a: self._update_preview())
+        self._update_preview()
+
+    def _remove_term_row(self, entry):
+        if entry in self.term_rows:
+            self.term_rows.remove(entry)
+            entry[2].destroy()
+            self._update_preview()
+
+    # -------------------------------------------------------------- range
     def _preset_key(self):
         return next(k for k, v in self.preset_labels.items() if v == self.preset.get())
 
@@ -244,25 +277,29 @@ class MergedDialog(tk.Toplevel):
             lo, hi = RANGE_PRESETS[key]
             self.min.set("%g" % lo)
             self.max.set("%g" % hi)
+            self.mid.set("%g" % ((lo + hi) / 2))
         self._update_preview()
 
     def _read(self):
-        side = lambda v: None if v.get() == self.none_label else v.get()  # noqa: E731
+        terms = [MergedTerm(c.get(), float(w.get())) for c, w, _ in self.term_rows if c.get()]
         try:
             bits = int(self.osc_bits.get())
         except (ValueError, tk.TclError):
             bits = 0
-        return MergedParam(self.name.get().strip(), side(self.pos), side(self.neg), float(self.min.get()),
-                           float(self.max.get()), bool(self.enabled.get()), self.osc_format.get(), bits)
+        lo, mid, hi = float(self.min.get()), float(self.mid.get()), float(self.max.get())
+        return MergedParam(self.name.get().strip(), terms, lo, hi, None if mid == (lo + hi) / 2 else mid,
+                           bool(self.enabled.get()), self.osc_format.get(), bits)
 
     def _update_preview(self):
+        if not hasattr(self, "preview"):
+            return
         t = self.app.t
         try:
             m = self._read()
         except ValueError:
             self.preview.configure(text="")
             return
-        text = t("merged_preview") % (m.negative or t("none"), m.out_min, m.neutral, m.positive or t("none"), m.out_max)
+        text = t("merged_preview2") % (m.formula(), m.out_min, m.neutral, m.out_max)
         if m.osc_format != "float":
             text += "\n" + t("binary_signed" if m.signed else "binary_unsigned")
         if m.beyond_sync_range:
@@ -273,9 +310,9 @@ class MergedDialog(tk.Toplevel):
         try:
             m = self._read()
         except ValueError:
-            messagebox.showerror(self.app.t("error"), "min / max", parent=self)
+            messagebox.showerror(self.app.t("error"), self.app.t("merged_bad_number"), parent=self)
             return
-        problems = merged_param_problems(m, {c.name for c in self.app.cfg.classes})
+        problems = merged_param_problems(m, set(self.class_names))
         others = [p for p in self.app.cfg.merged_params if p is not self.app._editing_merged]
         if any(p.name == m.name for p in others):
             problems.append(self.app.t("merged_duplicate") % m.name)
@@ -659,11 +696,11 @@ class App:
         ttk.Label(tab, text=t("merged_help"), foreground="#666", wraplength=940, justify="left").pack(anchor="w")
         box = ttk.Frame(tab)
         box.pack(fill="both", expand=True, pady=6)
-        cols = ("pos", "neg", "range", "format", "value")
+        cols = ("terms", "range", "format", "value")
         self.merged_tree = ttk.Treeview(box, columns=cols, show="tree headings", selectmode="browse")
         self.merged_tree.heading("#0", text=t("col_name"))
-        for col, key, width in (("pos", "merged_pos", 130), ("neg", "merged_neg", 130), ("range", "merged_range", 140),
-                                ("format", "merged_format", 150), ("value", "merged_value", 110)):
+        for col, key, width in (("terms", "merged_terms", 270), ("range", "merged_range", 140),
+                                ("format", "merged_format", 140), ("value", "merged_value", 100)):
             self.merged_tree.heading(col, text=t(key))
             self.merged_tree.column(col, width=width, anchor="w" if col != "value" else "e")
         self.merged_tree.pack(side="left", fill="both", expand=True)
@@ -698,8 +735,7 @@ class App:
             if m.osc_format != "float":
                 fmt += " %d bit" % m.osc_bits
             self.merged_tree.insert("", "end", iid=str(i), text=m.name, values=(
-                m.positive or "-", m.negative or "-", "%g .. %g .. %g" % (m.out_min, m.neutral, m.out_max), fmt,
-                value))
+                m.formula(), "%g .. %g .. %g" % (m.out_min, m.neutral, m.out_max), fmt, value))
 
     def _update_merged_values(self):
         values = self.engine.last_merged
@@ -1238,10 +1274,9 @@ class App:
             self.cfg.classes[i] = d.result
             if d.result.name != old_name:  # keep merged parameters pointing at the renamed class
                 for m in self.cfg.merged_params:
-                    if m.positive == old_name:
-                        m.positive = d.result.name
-                    if m.negative == old_name:
-                        m.negative = d.result.name
+                    for term in m.terms:
+                        if term.cls == old_name:
+                            term.cls = d.result.name
             self._classes_changed()
 
     def on_remove_class(self):

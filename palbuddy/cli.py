@@ -25,8 +25,9 @@ HELP = """commands:
   arch [standard|lite]  model size used for the next training
   vrcft [status|install|uninstall]  VRCFaceTracking v6 module
   merged                             list merged parameters (sent to VRChat over OSC)
-  merged add NAME POS NEG [MIN MAX [FORMAT BITS]]
-                                     e.g. "merged add PBG_SmileSad smile sad -1 1 binary 4" (- = no class)
+  merged add NAME TERMS [MIN NEUTRAL MAX [FORMAT BITS]]
+                                     TERMS: classes with weights, e.g. "smile,-sad" or "0.2*wide,0.8*open,-squeeze"
+                                     e.g. "merged add PBG_SmileSad smile,-sad -1 0 1 binary 4"
   merged remove NAME
   oscout CLASS OSCNAME [float|binary|both] [BITS]   send a class straight to VRChat (OSCNAME - = off)
   sens CLASS LOW HIGH                sensitivity: stretch LOW..HIGH of the class to 0..1
@@ -144,14 +145,14 @@ def run_cli(engine):
                         print("SRanipal module: %s (%s)" % (m["name"], "wrapped" if m["disabled"] else "standalone"))
                     print("connected module protocol: %s" % engine.vrcft.protocol)
             elif cmd == "merged":
-                from .config import MergedParam, merged_param_problems
+                from .config import MergedParam, merged_param_problems, parse_terms
                 c = engine.cfg
                 words = arg.split()
-                if words[:1] == ["add"] and len(words) in (4, 6, 8):
-                    lo, hi = (float(words[4]), float(words[5])) if len(words) >= 6 else (-1.0, 1.0)
+                if words[:1] == ["add"] and len(words) in (3, 6, 8):
+                    lo, mid, hi = (float(words[3]), float(words[4]), float(words[5])) if len(words) >= 6 \
+                        else (-1.0, None, 1.0)
                     fmt, bits = (words[6], int(words[7])) if len(words) == 8 else ("float", 4)
-                    m = MergedParam(words[1], None if words[2] == "-" else words[2],
-                                    None if words[3] == "-" else words[3], lo, hi, True, fmt, bits)
+                    m = MergedParam(words[1], parse_terms(words[2]), lo, hi, mid, True, fmt, bits)
                     problems = merged_param_problems(m, {x.name for x in c.classes})
                     if any(p.name == m.name for p in c.merged_params):
                         problems.append("'%s' already exists" % m.name)
@@ -163,13 +164,12 @@ def run_cli(engine):
                     c.merged_params = [m for m in c.merged_params if m.name != words[1]]
                     engine.save_config()
                 elif words:
-                    raise ValueError("usage: merged | merged add NAME POS NEG [MIN MAX [FORMAT BITS]] | "
+                    raise ValueError("usage: merged | merged add NAME TERMS [MIN NEUTRAL MAX [FORMAT BITS]] | "
                                      "merged remove NAME")
                 for m in c.merged_params:
-                    print("  %-16s + %-12s - %-12s  %g .. %g .. %g%s  now %s" % (
-                        m.name, m.positive or "-", m.negative or "-", m.out_min, m.neutral, m.out_max,
-                        "" if m.enabled else " (off)", "%.3f" % engine.last_merged[m.name]
-                        if m.name in engine.last_merged else "-"))
+                    print("  %-16s = %-32s  %g .. %g .. %g%s  now %s" % (
+                        m.name, m.formula(), m.out_min, m.neutral, m.out_max, "" if m.enabled else " (off)",
+                        "%.3f" % engine.last_merged[m.name] if m.name in engine.last_merged else "-"))
                 print("  OSC %s -> %s:%d" % ("on" if c.osc_enabled else "off", c.osc_host, c.osc_port))
             elif cmd in ("oscout", "sens"):
                 from .config import class_output_problems

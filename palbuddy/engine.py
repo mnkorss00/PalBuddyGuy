@@ -96,8 +96,8 @@ class Engine:
         VRCFaceTracking's names, no parameter written twice). Cached until settings change."""
         cfg = self.cfg
         key = (tuple((c.name, c.osc_name, c.osc_format, c.osc_bits) for c in cfg.classes),
-               tuple((m.name, m.positive, m.negative, m.out_min, m.out_max, m.enabled, m.osc_format, m.osc_bits)
-                     for m in cfg.merged_params))
+               tuple((m.name, tuple((t.cls, t.weight) for t in m.terms), m.out_min, m.out_max, m.out_neutral,
+                      m.enabled, m.osc_format, m.osc_bits) for m in cfg.merged_params))
         if key != self._osc_plan_key:
             plan, used = [], set()
             names = {c.name for c in cfg.classes}
@@ -135,9 +135,9 @@ class Engine:
                 w = weights.get(obj.name, 0.0)
                 self._send_output(obj.osc_name, obj.osc_format, obj.osc_bits, w, w, False, False, force)
             elif obj.name in merged:
-                mag, neg = obj.binary_input(weights)
-                self._send_output(obj.name, obj.osc_format, obj.osc_bits, merged[obj.name], mag, neg, obj.signed,
-                                  force)
+                value = merged[obj.name]
+                mag, neg = obj.binary_input_of(value) if obj.osc_format != "float" else (0.0, False)
+                self._send_output(obj.name, obj.osc_format, obj.osc_bits, value, mag, neg, obj.signed, force)
 
     def _send_merged_neutral(self):
         """Tracking stopped: leave every OSC output at its neutral value, not frozen."""

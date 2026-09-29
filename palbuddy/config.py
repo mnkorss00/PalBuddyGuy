@@ -89,60 +89,115 @@ def binary_bits(value, bits):
 
 PARAM_NAME_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 
-# (min, max) presets for merged parameters: negative class -> min, neutral -> centre, positive -> max
+# (min, max) presets for merged parameters: combined -1 -> min, 0 -> neutral (middle), +1 -> max
 RANGE_PRESETS = {"-1..1": (-1.0, 1.0), "0..1": (0.0, 1.0), "0..2": (0.0, 2.0)}
+MAX_TERM_WEIGHT = 10.0
+
+
+@dataclass
+class MergedTerm:
+    """One class in a merged parameter and how much it contributes (negative = pulls down)."""
+
+    cls: str
+    weight: float = 1.0
 
 
 @dataclass
 class MergedParam:
-    """A custom avatar parameter combining two trained classes, sent to VRChat over OSC.
+    """A custom avatar parameter combining two or more trained classes, sent over OSC.
 
-    value = positive class weight - negative class weight   (-1..1, 0 = neither)
-    mapped linearly so that -1 -> out_min, 0 -> the middle, +1 -> out_max.
-    E.g. smile (0..1) and sad (0..1) -> "SmileSad" in -1..1, or 0..2 with neutral at 1.
-    Either class may be empty (e.g. only a positive side).
+    combined = sum(term.weight * class weight), clamped to -1..1 (0 when all classes are 0),
+    then mapped piecewise-linearly: -1 -> out_min, 0 -> neutral, +1 -> out_max.
+    E.g. smile(+1) + sad(-1) -> -1..1, or in the spirit of VRCFT's EyeLidExpandedSqueeze:
+    0.2*wide + 0.8*open - 1*squeeze. neutral defaults to the middle of the range.
     """
 
     name: str
-    positive: Optional[str] = None
-    negative: Optional[str] = None
+    terms: List[MergedTerm] = field(default_factory=list)
     out_min: float = -1.0
     out_max: float = 1.0
+    out_neutral: Optional[float] = None  # None = middle of out_min..out_max
     enabled: bool = True
     osc_format: str = "float"
     osc_bits: int = 4
 
+    @classmethod
+    def pair(cls, name, positive=None, negative=None, out_min=-1.0, out_max=1.0, **kw):
+        """The classic "positive - negative" merged parameter."""
+        terms = [MergedTerm(c, w) for c, w in ((positive, 1.0), (negative, -1.0)) if c]
+        return cls(name, terms, out_min, out_max, **kw)
+
+    @property
+    def classes(self):
+        return [t.cls for t in self.terms]
+
+    @property
+    def neutral(self):
+        return (self.out_min + self.out_max) / 2.0 if self.out_neutral is None else self.out_neutral
+
     def combined(self, weights):
-        """positive - negative, -1..1."""
-        pos = weights.get(self.positive, 0.0) if self.positive else 0.0
-        neg = weights.get(self.negative, 0.0) if self.negative else 0.0
-        return min(1.0, max(-1.0, pos - neg))
+        """Weighted sum of the classes, -1..1."""
+        total = 0.0
+        for t in self.terms:
+            total += t.weight * weights.get(t.cls, 0.0)
+        return min(1.0, max(-1.0, total))
+
+    def value_of(self, c):
+        """Map a combined value (-1..1) to the output range through the neutral point."""
+        n = self.neutral
+        return n + c * (self.out_max - n) if c >= 0 else n + c * (n - self.out_min)
 
     def combine(self, weights):
         """weights: {class name: weight 0..1} -> output value."""
-        return self.out_min + (self.combined(weights) + 1.0) / 2.0 * (self.out_max - self.out_min)
+        return self.value_of(self.combined(weights))
 
     @property
     def signed(self):
         """A range crossing 0: binary output uses sign + magnitude (a Negative bool), like VRCFT."""
         return min(self.out_min, self.out_max) < 0 < max(self.out_min, self.out_max)
 
-    def binary_input(self, weights):
-        """(value 0..1 to encode, negative) for binary output. Signed ranges: |c| and c < 0;
-        otherwise the position within the range (0 = min end, 1 = max end)."""
-        c = self.combined(weights)
+    def binary_input_of(self, value):
+        """(value 0..1 to encode, negative) for binary output of an output value. Signed ranges:
+        magnitude relative to the end on that side of 0; otherwise the position within the range."""
         if self.signed:
-            return abs(c), c < 0
-        return (c + 1.0) / 2.0, False
+            end = max(self.out_min, self.out_max) if value >= 0 else min(self.out_min, self.out_max)
+            return (value / end if end else 0.0), value < 0
+        return (value - self.out_min) / (self.out_max - self.out_min), False
 
-    @property
-    def neutral(self):
-        return (self.out_min + self.out_max) / 2.0
+    def binary_input(self, weights):
+        return self.binary_input_of(self.combine(weights))
+
+    def formula(self):
+        """Human-readable sum, e.g. "smile - sad" or "0.2*wide + 0.8*open - squeeze"."""
+        parts = []
+        for i, t in enumerate(self.terms):
+            body = t.cls if abs(t.weight) == 1 else "%g*%s" % (abs(t.weight), t.cls)
+            sign = "-" if t.weight < 0 else "+"
+            parts.append(("-" if t.weight < 0 else "") + body if i == 0 else " %s %s" % (sign, body))
+        return "".join(parts).strip() or "-"
 
     @property
     def beyond_sync_range(self):
         """VRChat syncs float parameters as -1..1; larger values only work locally."""
         return min(self.out_min, self.out_max) < -1.0 or max(self.out_min, self.out_max) > 1.0
+
+
+def parse_terms(text):
+    """"smile,-sad,0.2*wide,-0.5*squeeze" -> [MergedTerm]."""
+    terms = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        sign = -1.0 if part.startswith("-") else 1.0
+        part = part.lstrip("+-").strip()
+        if "*" in part:
+            coef, name = part.split("*", 1)
+            weight = sign * float(coef)
+        else:
+            name, weight = part, sign
+        terms.append(MergedTerm(name.strip(), weight))
+    return terms
 
 
 @dataclass
@@ -277,9 +332,7 @@ class Config:
         class_fields = set(ExpressionClass.__dataclass_fields__)
         classes = [ExpressionClass(**{k: v for k, v in c.items() if k in class_fields})
                    for c in data.pop("classes", []) if isinstance(c, dict) and "name" in c]
-        merged_fields = set(MergedParam.__dataclass_fields__)
-        merged = [MergedParam(**{k: v for k, v in m.items() if k in merged_fields})
-                  for m in data.pop("merged_params", []) if isinstance(m, dict) and "name" in m]
+        merged = [merged_from_dict(m) for m in data.pop("merged_params", []) if isinstance(m, dict) and "name" in m]
         known = set(cls.__dataclass_fields__)
         cfg = cls(**{k: v for k, v in data.items() if k in known})
         cfg.classes = classes
@@ -326,16 +379,33 @@ def class_output_problems(c):
     return _osc_name_problems("OSC parameter", c.osc_name, c.osc_format, c.osc_bits, False)
 
 
+def merged_from_dict(d):
+    """Also reads the older {"positive": ..., "negative": ...} form."""
+    fields_ = set(MergedParam.__dataclass_fields__)
+    kw = {k: v for k, v in d.items() if k in fields_ and k != "terms"}
+    if "terms" in d:
+        kw["terms"] = [MergedTerm(str(t.get("cls", "")), float(t.get("weight", 1.0)))
+                       for t in d["terms"] if isinstance(t, dict)]
+    else:
+        kw["terms"] = [MergedTerm(c, w) for c, w in ((d.get("positive"), 1.0), (d.get("negative"), -1.0)) if c]
+    return MergedParam(**kw)
+
+
 def merged_param_problems(m, class_names):
     """Reasons a merged parameter can't be used (empty list = fine)."""
     problems = _osc_name_problems("Merged parameter", m.name, m.osc_format, m.osc_bits, m.signed)
-    if not m.positive and not m.negative:
-        problems.append("Merged parameter '%s' needs a positive or a negative class." % m.name)
-    for side in (m.positive, m.negative):
-        if side and side not in class_names:
-            problems.append("Merged parameter '%s' uses unknown class '%s'." % (m.name, side))
+    if not any(t.cls and t.weight for t in m.terms):
+        problems.append("Merged parameter '%s' needs at least one class with a non-zero weight." % m.name)
+    for t in m.terms:
+        if t.cls not in class_names:
+            problems.append("Merged parameter '%s' uses unknown class '%s'." % (m.name, t.cls))
+        if abs(t.weight) > MAX_TERM_WEIGHT:
+            problems.append("Merged parameter '%s': weight of '%s' must be within +-%g." % (m.name, t.cls,
+                                                                                           MAX_TERM_WEIGHT))
     if m.out_min == m.out_max:
         problems.append("Merged parameter '%s' needs different min and max values." % m.name)
+    elif not min(m.out_min, m.out_max) <= m.neutral <= max(m.out_min, m.out_max):
+        problems.append("Merged parameter '%s': the neutral value must lie between min and max." % m.name)
     return problems
 
 
