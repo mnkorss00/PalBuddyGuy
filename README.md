@@ -72,6 +72,29 @@ Click **Train**. The loss curve should drop below the 0.001 line by the end. If 
 Click **Start tracking**. Each output is shown as its raw value and the value sent to VRCFT.
 **FastCal** puppets each shape on your avatar one after another. Copy it with your face. The measured strengths become each class's *max power*, which you can also edit by hand in the Train tab. **Smoothing** reduces jitter at the cost of a little latency.
 
+## 5. Inference performance (Settings tab → Inference performance)
+Tracking runs the network on every new frame, about 60 times a second. You can trade GPU, CPU and latency against each other:
+
+| Setting | What it does |
+|---|---|
+| **Run on** | *auto* uses the GPU if there is one. *CPU* leaves the GPU entirely to VR, and CUDA is never started, which saves its VRAM. *GPU* forces the GPU. |
+| **CPU threads** | Default 1. More threads cut latency but **increase** total CPU use. |
+| **int8 quantization** | On the CPU, stores the big linear layer as int8: about 2× faster and 4× less memory traffic, with the same model and no retraining. The output difference is about 0.003. |
+| **Max tracking rate** | For example 30 Hz. Skips frames in between and halves the work. Combine it with *Smoothing* on the Live tab. |
+
+**Benchmark this PC** times CPU fp32, CPU int8 and GPU with your model, so you can pick what works best on your machine. The Live tab shows the running backend, the time per frame and the whole process's CPU use.
+
+Measured on one 2.8 GHz Xeon core with frames arriving at 60 Hz (whole-process CPU, % of one core):
+
+| Backend | ms/frame | CPU |
+|---|---|---|
+| fp32, 4 threads (old default: all cores) | 8.0 | 105 % |
+| fp32, 1 thread | 12.7 | 76 % |
+| **int8, 1 thread** (new CPU default) | 7.1 | 47 % |
+| int8, 1 thread, max 30 Hz | 7.5 | 23 % |
+
+Idle OpenMP threads are also told not to busy-wait (`OMP_WAIT_POLICY=PASSIVE`), so they don't burn CPU between frames.
+
 # What changed compared to the original scripts
 **GUI**
 * Tkinter GUI (no extra dependencies) with live connection status, camera preview, output meters, recording with progress, a class/dataset editor, training with a live loss chart and ETA, FastCal, and settings. Available in English and Korean.

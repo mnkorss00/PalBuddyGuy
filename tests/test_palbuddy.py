@@ -396,6 +396,78 @@ class SingleTrackerTests(unittest.TestCase):
         self.assertEqual(e.mode_hint({"eye": ok, "face": ok}), "both")
 
 
+class InferencePerfTests(unittest.TestCase):
+    def test_runtime_matches_model(self):
+        from palbuddy.inference import Runtime
+        m = BuddyNet(5).eval()
+        x = np.random.default_rng(0).random((1, 128, 20, 20), dtype=np.float32)
+        with torch.no_grad():
+            ref = m(torch.from_numpy(x))[0].numpy()
+        sample = (x[0, :64].tobytes(), x[0, 64:].tobytes())
+        fp32 = Runtime(m, "cpu", 1, int8=False)
+        self.assertEqual(fp32.describe(), "CPU fp32 ×1")
+        np.testing.assert_allclose(fp32.predict(sample), ref, atol=1e-5)
+        q = Runtime(m, "cpu", 1, int8=True)
+        if q.quantized:
+            self.assertEqual(q.describe(), "CPU int8 ×1")
+            self.assertLess(np.abs(q.predict(sample) - ref).max(), 0.05)
+        # the original model is untouched by quantization
+        self.assertIsInstance(m.linear1, torch.nn.Linear)
+
+    def test_runtime_single_tracker(self):
+        from palbuddy.inference import Runtime
+        m = BuddyNet(2, "eye").eval()
+        rt = Runtime(m, "cpu", 1, int8=False)
+        self.assertEqual(rt.predict((neural(1.0), None)).shape, (2,))
+        self.assertIsNone(rt.predict((None, neural(1.0))))
+
+    def test_benchmark(self):
+        from palbuddy.inference import benchmark
+        res = benchmark(BuddyNet(3), threads=1, frames=5, include_gpu=False, log_fn=lambda *a: None)
+        self.assertGreaterEqual(len(res), 1)
+        self.assertTrue(all(r["ms"] > 0 for r in res))
+
+    def test_rate_cap_and_thread_restore(self):
+        cfg = Config(face_port=0, eye_port=0, vrcft_port=0, input_mode="face", max_infer_rate=10,
+                     infer_device="cpu", infer_threads=1, classes=[ExpressionClass("n"), ExpressionClass("s")])
+        engine = Engine(cfg).start()
+        self.addCleanup(engine.stop)
+        engine.model = BuddyNet(2, "face")
+        threads_before = torch.get_num_threads()
+        engine.start_inference()
+        self.assertTrue(wait_for(lambda: engine.infer_backend is not None))
+        stop = threading.Event()
+
+        def feed():  # 100 Hz of frames
+            while not stop.is_set():
+                engine.hub.push(None, neural(0.5))
+                time.sleep(0.01)
+        threading.Thread(target=feed, daemon=True).start()
+        time.sleep(2.2)
+        rate = engine.infer_rate.rate()
+        stop.set()
+        self.assertLess(rate, 13)
+        self.assertGreater(rate, 5)
+        engine.stop_inference()
+        self.assertEqual(torch.get_num_threads(), threads_before)
+        self.assertIsNone(engine.infer_backend)
+
+    def test_benchmark_via_engine_resumes_tracking(self):
+        cfg = Config(face_port=0, eye_port=0, vrcft_port=0, infer_device="cpu",
+                     classes=[ExpressionClass("n"), ExpressionClass("s")])
+        engine = Engine(cfg).start()
+        self.addCleanup(engine.stop)
+        engine.model = BuddyNet(2)
+        engine.start_inference()
+        done = threading.Event()
+        out = {}
+        engine.run_benchmark(on_done=lambda r, e: (out.update(r=r, e=e), done.set()))
+        self.assertTrue(done.wait(120))
+        self.assertIsNone(out["e"])
+        self.assertTrue(wait_for(lambda: engine.inferring))
+        self.assertIsNone(engine.busy)
+
+
 class ConfigTests(unittest.TestCase):
     def test_roundtrip(self):
         cfg = default_config()

@@ -75,6 +75,10 @@ class Config:
     # Inference
     smoothing: float = 0.0  # 0 = off, otherwise EMA factor in (0, 1)
     max_send_rate: float = 120.0  # Hz cap for VRCFT updates
+    infer_device: str = "auto"  # "auto" (GPU if available), "cpu" or "gpu"
+    infer_threads: int = 1  # CPU threads for inference; more = lower latency but more total CPU
+    infer_int8: bool = True  # int8-quantize the linear layers when inferring on the CPU
+    max_infer_rate: float = 0.0  # Hz cap for running the network, 0 = every new frame
 
     # GUI
     language: str = "auto"  # "auto", "en" or "ko"

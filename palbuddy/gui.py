@@ -385,7 +385,7 @@ class App:
         def path_row(label, key, is_dir):
             def make():
                 f = ttk.Frame(tab)
-                ttk.Entry(f, textvariable=self.settings[key], width=50).pack(side="left")
+                ttk.Entry(f, textvariable=self.settings[key], width=34).pack(side="left")
 
                 def browse():
                     if is_dir:
@@ -415,6 +415,39 @@ class App:
         line(t("language"), lambda: ttk.Combobox(tab, textvariable=self.lang_var, values=("auto", "en", "ko"),
                                                  state="readonly", width=8))
         ttk.Button(tab, text=t("save"), command=self.on_save_settings).grid(row=row, column=1, sticky="w", pady=12)
+        self._build_perf_box(tab).grid(row=0, column=2, rowspan=row + 1, sticky="nw", padx=(24, 0))
+
+    def _build_perf_box(self, parent):
+        t = self.t
+        c = self.cfg
+        box = ttk.LabelFrame(parent, text=t("perf"), padding=8)
+        self.dev_labels = {d: t("dev_" + d) for d in ("auto", "cpu", "gpu")}
+        self.dev_var = tk.StringVar(value=self.dev_labels.get(c.infer_device, self.dev_labels["auto"]))
+        self.threads_var = tk.IntVar(value=c.infer_threads)
+        self.int8_var = tk.BooleanVar(value=c.infer_int8)
+        self.rate_var = tk.DoubleVar(value=c.max_infer_rate)
+        ttk.Label(box, text=t("infer_device")).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Combobox(box, textvariable=self.dev_var, state="readonly", width=30,
+                     values=list(self.dev_labels.values())).grid(row=1, column=0, columnspan=2, sticky="w",
+                                                                 pady=(0, 4))
+        ttk.Label(box, text=t("infer_threads")).grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Spinbox(box, from_=1, to=max(1, os.cpu_count() or 1), textvariable=self.threads_var,
+                    width=5).grid(row=2, column=1, sticky="w", padx=(6, 0))
+        ttk.Checkbutton(box, text=t("infer_int8"), variable=self.int8_var).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Label(box, text=t("max_infer_rate")).grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Spinbox(box, from_=0, to=240, increment=10, textvariable=self.rate_var, width=6).grid(
+            row=4, column=1, sticky="w", padx=(6, 0))
+        btns = ttk.Frame(box)
+        btns.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        ttk.Button(btns, text=t("perf_apply"), command=self.on_apply_perf).pack(side="left")
+        self.bench_btn = ttk.Button(btns, text=t("benchmark"), command=self.on_benchmark)
+        self.bench_btn.pack(side="left", padx=6)
+        ttk.Label(box, text=t("bench_note"), foreground="#666", wraplength=330).grid(
+            row=6, column=0, columnspan=2, sticky="w")
+        self.bench_result = ttk.Label(box, text="", font=("TkFixedFont", 9), justify="left")
+        self.bench_result.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        return box
 
     def _build_log_tab(self):
         tab = ttk.Frame(self.nb, padding=4)
@@ -510,9 +543,13 @@ class App:
             model += "*"
         self.device_label.configure(text="%s: %s   %s" % (t("device"), s["device"], model))
 
-        if s["inferring"]:
+        if s["inferring"] and not s["infer_backend"]:
             self.infer_btn.configure(text=t("stop_infer"))
-            self.infer_stats.configure(text=t("infer_stats") % (s["infer_fps"], s["latency_ms"]))
+            self.infer_stats.configure(text=t("preparing"))
+        elif s["inferring"]:
+            self.infer_btn.configure(text=t("stop_infer"))
+            self.infer_stats.configure(text=t("infer_stats") % (s["infer_fps"], s["latency_ms"],
+                                                                s["infer_backend"] or "-", s["process_cpu"]))
         else:
             self.infer_btn.configure(text=t("start_infer"))
             self.infer_stats.configure(text=t("not_tracking"))
@@ -767,6 +804,38 @@ class App:
             self._rebuild_bars()
         except Exception as e:
             self._error(e)
+
+    def _read_perf(self):
+        dev = next(d for d, text in self.dev_labels.items() if text == self.dev_var.get())
+        threads = max(1, int(self.threads_var.get()))
+        rate = max(0.0, float(self.rate_var.get()))
+        return dev, threads, bool(self.int8_var.get()), rate
+
+    def on_apply_perf(self):
+        try:
+            c = self.cfg
+            c.infer_device, c.infer_threads, c.infer_int8, c.max_infer_rate = self._read_perf()
+            self.engine.save_config()
+            self.engine.restart_inference()
+        except Exception as e:
+            self._error(e)
+
+    def on_benchmark(self):
+        try:
+            self.cfg.infer_threads = self._read_perf()[1]
+            self.engine.run_benchmark(on_done=lambda r, err: self.events.put(("bench_done", r, err)))
+            self.bench_btn.state(["disabled"])
+            self.bench_result.configure(text=self.t("bench_running"))
+        except Exception as e:
+            self._error(e)
+
+    def _ev_bench_done(self, results, error):
+        self.bench_btn.state(["!disabled"])
+        if error:
+            self.bench_result.configure(text=error)
+            return
+        self.bench_result.configure(text="\n".join(
+            self.t("bench_line") % (r["backend"], r["ms"], r["cpu_pct"]) for r in results))
 
     def on_save_settings(self):
         try:

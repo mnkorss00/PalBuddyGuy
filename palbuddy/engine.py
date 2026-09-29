@@ -11,6 +11,7 @@ import torch
 from . import trainer
 from .config import Config
 from .datasets import Recorder, convert_legacy_pickles
+from .inference import Runtime, benchmark
 from .frames import FrameHub, ProxyClient, RateMeter, SRanipalReceiver
 from .model import BuddyNet, pick_device
 from .vrcft import VRCFTServer, encode_params
@@ -44,6 +45,9 @@ class Engine:
         self.fastcal_state = None  # text shown while fastcal runs
         self.infer_rate = RateMeter()
         self.infer_latency_ms = 0.0
+        self.infer_backend = None  # e.g. "CPU int8 ×1"
+        self._cpu_sample = (time.monotonic(), time.process_time())
+        self.process_cpu_pct = 0.0
         self.last_raw = None  # np.ndarray of raw outputs
         self.last_out = {}  # class index -> normalized value sent to VRCFT
         self._smoothed = {}
@@ -90,9 +94,20 @@ class Engine:
             return "both"
         return None
 
+    def _update_cpu(self):
+        now, cpu = time.monotonic(), time.process_time()
+        t0, c0 = self._cpu_sample
+        if now - t0 >= 1.0:
+            # % of one core used by the whole process (all threads)
+            self.process_cpu_pct = (cpu - c0) / (now - t0) * 100
+            self._cpu_sample = (now, cpu)
+        return self.process_cpu_pct
+
     def status(self):
         streams = self.source.snapshot(self.cfg.stall_timeout) if self.source else {}
         return {
+            "infer_backend": self.infer_backend,
+            "process_cpu": self._update_cpu(),
             "streams": streams,
             "input_mode": self.cfg.input_mode,
             "mode_hint": self.mode_hint(streams),
@@ -138,7 +153,9 @@ class Engine:
 
     def load_model(self, path=None):
         path = path or self.cfg.model_path
-        self.model = BuddyNet.load(path, self.device, expected_outputs=self.cfg.num_classes,
+        # loaded on the CPU; the inference runtime / trainer move it where needed, so
+        # CPU-only tracking never initialises CUDA (saves its VRAM context)
+        self.model = BuddyNet.load(path, None, expected_outputs=self.cfg.num_classes,
                                    expected_mode=self.cfg.input_mode).eval()
         self.model_dirty = False
         log.info("Loaded model %s", path)
@@ -256,37 +273,62 @@ class Engine:
             self.start_inference()
         self._fastcal_request.set()
 
-    def _predictor(self):
-        model = self.model.eval()
-        device = self.device
-        pin = device.type == "cuda"
-        mode = model.input_mode
-        host = torch.empty((1, 128 if mode == "both" else 64, 20, 20), dtype=torch.float32, pin_memory=pin)
-        host_np = host.numpy()
-        # where each tracker's features go in the input tensor (None = not used)
-        eye_at = 0 if mode in ("both", "eye") else None
-        face_at = 64 if mode == "both" else (0 if mode == "face" else None)
+    def restart_inference(self):
+        """Apply changed performance settings to a running tracker."""
+        if self.inferring:
+            self.stop_inference()
+            self.start_inference()
 
-        @torch.inference_mode()
-        def predict(sample):
-            eye, face = sample
-            for data, at in ((eye, eye_at), (face, face_at)):
-                if at is None:
-                    continue
-                if data is None:  # a needed tracker is missing from this sample
-                    return None
-                host_np[0, at:at + 64] = np.frombuffer(data, dtype=np.float32).reshape(64, 20, 20)
-            return model(host.to(device, non_blocking=pin))[0].float().cpu().numpy()
+    def run_benchmark(self, on_done=None):
+        """Compare CPU fp32 / CPU int8 / GPU on this PC in the background. Tracking
+        is paused meanwhile so it doesn't skew the numbers."""
+        if self.busy:
+            raise RuntimeError("Already %s" % self.busy)
+        was_inferring = self.inferring
+        self.stop_inference()
+        self.busy = "benchmarking"
+        model = self.model if self.model is not None else BuddyNet(max(1, self.cfg.num_classes), self.cfg.input_mode)
 
-        return predict
+        def run():
+            results, error = [], None
+            try:
+                results = benchmark(model, threads=self.cfg.infer_threads)
+            except Exception as e:
+                log.exception("benchmark failed")
+                error = str(e)
+            finally:
+                self.busy = None
+            if was_inferring:
+                try:
+                    self.start_inference()
+                except Exception:
+                    log.exception("could not resume tracking")
+            if on_done:
+                on_done(results, error)
+
+        threading.Thread(target=run, daemon=True, name="benchmark").start()
 
     def _infer_loop(self):
-        predict = self._predictor()
+        cfg = self.cfg
+        try:
+            runtime = Runtime(self.model, cfg.infer_device, cfg.infer_threads, cfg.infer_int8)
+        except Exception:
+            log.exception("could not prepare the model for inference")
+            return
+        old_threads = torch.get_num_threads()
+        runtime.set_threads()
+        runtime.warmup()
+        predict = runtime.predict
+        self.infer_latency_ms = 0.0
+        self.infer_backend = runtime.describe()
         seq = 0
-        min_interval = 1.0 / self.cfg.max_send_rate if self.cfg.max_send_rate > 0 else 0.0
+        min_interval = 1.0 / cfg.max_send_rate if cfg.max_send_rate > 0 else 0.0
+        infer_interval = 1.0 / cfg.max_infer_rate if cfg.max_infer_rate > 0 else 0.0
+        next_due = 0.0
         last_send = 0.0
         waiting_logged = False
-        log.info("Inference started")
+        log.info("Inference started (%s%s)", self.infer_backend,
+                 ", max %.0f Hz" % cfg.max_infer_rate if infer_interval else "")
         while not self._infer_stop.is_set():
             if self._fastcal_request.is_set():
                 self._fastcal_request.clear()
@@ -296,6 +338,12 @@ class Engine:
                     log.exception("fastcal failed")
                 self.fastcal_state = None
                 continue
+            if infer_interval:
+                # rate cap: sleep until the next slot, then take the newest frame
+                # (frames in between are skipped, not queued)
+                delay = next_due - time.monotonic()
+                if delay > 0 and self._infer_stop.wait(delay):
+                    break
             # Only run the network on *new* frames (the old loop re-ran on the
             # same frame every 10ms and slept even when a new frame was ready).
             seq, sample = self.hub.wait_next(seq, timeout=0.5)
@@ -309,8 +357,12 @@ class Engine:
             raw = predict(sample)
             if raw is None:
                 continue
-            self.infer_latency_ms = (time.perf_counter() - t0) * 1000
+            ms = (time.perf_counter() - t0) * 1000
+            # smoothed so the display is readable; first value taken as is
+            self.infer_latency_ms = ms if not self.infer_latency_ms else self.infer_latency_ms * 0.9 + ms * 0.1
             self.infer_rate.tick()
+            if infer_interval:
+                next_due = max(next_due + infer_interval, time.monotonic())
             self.last_raw = raw
 
             alpha = self.cfg.smoothing
@@ -328,6 +380,8 @@ class Engine:
             if pairs and now - last_send >= min_interval:
                 self.vrcft.send_params(pairs)
                 last_send = now
+        torch.set_num_threads(old_threads)  # process global; don't starve CPU training later
+        self.infer_backend = None
         log.info("Inference stopped")
 
     def _run_fastcal(self, predict):

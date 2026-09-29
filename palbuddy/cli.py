@@ -22,6 +22,9 @@ HELP = """commands:
   infer              start sending tracking to VRCFT (enter 'stop' to end)
   fastcal            calibrate max power by puppeting the avatar
   stop               stop inference / training / recording
+  perf [device auto|cpu|gpu] [threads N] [int8 on|off] [rate HZ]
+                     show / change inference performance settings
+  bench              compare CPU fp32 / CPU int8 / GPU on this PC
   stats              frame rate over 5 seconds
   convertmmap        convert old .pkl recordings to .mmap
   quit"""
@@ -64,6 +67,9 @@ def run_cli(engine):
                 print("  input mode %s%s" % (s["input_mode"], {
                     "single": "  (only one tracker is streaming: 'mode face' or 'mode eye')",
                     "both": "  (both trackers are streaming: 'mode both')"}.get(s["mode_hint"], "")))
+                if s["inferring"]:
+                    print("  tracking %.0f fps, %.1f ms/frame, %s, process CPU %.0f%%" % (
+                        s["infer_fps"], s["latency_ms"], s["infer_backend"], s["process_cpu"]))
                 print("  vrcft %s  device %s  inferring %s  model %s" % (
                     "connected" if s["vrcft"]["connected"] else "disconnected", s["device"], s["inferring"],
                     "loaded" if s["model_loaded"] else "-"))
@@ -81,6 +87,31 @@ def run_cli(engine):
                     print("only one tracker is streaming: use 'mode face' or 'mode eye'")
                 elif hint:
                     print("both trackers are streaming: consider 'mode both'")
+            elif cmd == "perf":
+                c = engine.cfg
+                words = arg.split()
+                for key, value in zip(words[::2], words[1::2]):
+                    if key == "device" and value in ("auto", "cpu", "gpu"):
+                        c.infer_device = value
+                    elif key == "threads":
+                        c.infer_threads = max(1, int(value))
+                    elif key == "int8":
+                        c.infer_int8 = value.lower() in ("on", "1", "true", "yes")
+                    elif key == "rate":
+                        c.max_infer_rate = max(0.0, float(value))
+                    else:
+                        raise ValueError("unknown perf setting %s %s" % (key, value))
+                if words:
+                    engine.save_config()
+                    engine.restart_inference()
+                print("device %s  threads %d  int8 %s  rate %s  (running: %s)" % (
+                    c.infer_device, c.infer_threads, "on" if c.infer_int8 else "off",
+                    "%.0f Hz" % c.max_infer_rate if c.max_infer_rate else "every frame",
+                    engine.infer_backend or "not tracking"))
+            elif cmd == "bench":
+                done_event.clear()
+                engine.run_benchmark(on_done=lambda r, err: (print(err) if err else None, done_event.set()))
+                done_event.wait()
             elif cmd == "record":
                 name = arg or input("dataset name: ")
                 done_event.clear()
@@ -175,6 +206,10 @@ def main(argv=None):
     for problem in cfg.validate():
         log.warning(problem)
 
+    # Idle OpenMP worker threads otherwise busy-spin for a while after every op,
+    # burning CPU that VRChat could use. Must be set before torch is imported.
+    os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+    os.environ.setdefault("KMP_BLOCKTIME", "0")
     try:
         from .engine import Engine  # imports torch; keep --help fast
     except ImportError as e:
