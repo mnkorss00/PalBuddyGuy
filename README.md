@@ -122,6 +122,20 @@ For **VRCFaceTracking v6**, install the module from the app with **Install / upd
 
 Details, the protocol and how to build or test the module: [`vrcft-module/README.md`](vrcft-module/README.md).
 
+## Merged parameters (Merged tab)
+Combine two trained classes into **one custom avatar parameter**, sent straight to VRChat over OSC (127.0.0.1:9000 by default):
+
+    value = positive class - negative class        e.g. smile - sad, from -1 to 1
+
+The value is mapped to the range you choose: **-1..1** (neutral 0), **0..1** (neutral 0.5), **0..2** (neutral 1), or custom min/max. With 0..2, for example, sad gives 0, neutral gives 1 and smile gives 2. Add a float parameter with the same name to your avatar's expression parameters and animator.
+
+* Either side may be empty, for example a positive class only.
+* Merged parameters are independent of the VRCFaceTracking targets. A class can drive a VRCFT shape and be part of a merged parameter at the same time.
+* When tracking stops, merged parameters are set back to their neutral value.
+* VRChat syncs float parameters in -1..1. Values outside that range, such as 0..2, only arrive as-is for local (unsynced) parameters. For synced ones, use -1..1 and rescale in the animator. The dialog warns about this.
+* Renaming a class updates the merged parameters that use it.
+* CLI: `merged`, `merged add SmileSad smile sad -1 1`, `merged remove SmileSad`.
+
 ## 7. Process priority (Settings tab → Inference performance)
 Tracking needs very little CPU, so by default the process runs at **below normal** priority and yields to VR and the game when the CPU is busy. On hybrid Intel CPUs (12th gen and later, e.g. the i7-12700K), **Efficiency cores only** keeps it off the P-cores entirely. On Windows 11, **Efficiency mode** (EcoQoS) lets the scheduler run it on slow, low-power cores. *low* priority is available too, but tracking may stutter when the CPU is fully loaded.
 
@@ -168,5 +182,6 @@ If you want the receiver in its own process, run `python tvm_proxy.py` and set t
 8. **설정 탭 → 추론 성능**: 기본값(자동: ONNX Runtime, CPU int8)으로도 가볍게 돌아갑니다. *이 PC에서 비교 측정*을 누르면 CPU/GPU/ONNX 중 어느 쪽이 이 PC에 맞는지 바로 확인할 수 있습니다. 학습 탭에서 *모델 크기 → 경량*을 고르면 추론이 약 5배 빨라집니다. 표준 모델과 검증 정확도를 비교해 보고 결정하세요.
 9. **설정 탭 → VRCFaceTracking 모듈 → 설치**: VRCFaceTracking v6용 모듈을 설치합니다. 먼저 VRCFaceTracking에서 SRanipal 모듈을 설치해 두세요. 설치하면 SRanipal 모듈은 Pal Buddy Guy 모듈 안에서 실행됩니다. v6는 눈과 표정을 각각 모듈 하나만 담당할 수 있기 때문입니다. 설치 후 VRCFaceTracking을 다시 시작하세요. *제거*를 누르면 원래대로 돌아갑니다. 대상 파라미터로 `BrowLowererLeft` 같은 **눈썹/눈 주변 표정**도 고를 수 있습니다.
 10. **프로세스 우선순위**: 기본값은 "보통 이하"라서 VR/게임에 CPU를 양보합니다. 12세대 이후 Intel CPU에서는 *E코어만 사용*, Windows 11에서는 *효율 모드*도 쓸 수 있습니다.
+11. **병합 파라미터 탭**: 두 클래스를 하나의 아바타 파라미터로 합칩니다. 값은 `긍정 − 부정`(예: 웃음 − 슬픔)이고, 범위는 **-1~1 / 0~1 / 0~2 / 직접 입력** 중에서 고릅니다. 값은 OSC로 VRChat에 직접 보내므로 아바타에 같은 이름의 float 파라미터를 추가하세요. VRChat의 동기화 float는 -1~1이라, 0~2는 동기화하지 않는 로컬 파라미터에서만 그대로 쓰입니다.
 
 언어는 설정 탭에서 바꿀 수 있습니다 (auto / en / ko).

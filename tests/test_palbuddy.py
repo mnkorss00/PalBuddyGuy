@@ -734,6 +734,115 @@ class RegressionTests(unittest.TestCase):
             shutil.copy2 = original
 
 
+def decode_osc(packet):
+    """-> (address, float) for a single-float OSC message."""
+    end = packet.index(b"\0")
+    address = packet[:end].decode()
+    i = (end + 4) & ~3
+    assert packet[i:i + 2] == b",f", packet
+    return address, struct.unpack(">f", packet[i + 4:i + 8])[0]
+
+
+class MergedParamTests(unittest.TestCase):
+    def test_osc_encoding(self):
+        from palbuddy.osc import encode_float
+        pkt = encode_float("/avatar/parameters/SmileSad", 0.25)
+        self.assertEqual(len(pkt) % 4, 0)
+        self.assertEqual(decode_osc(pkt), ("/avatar/parameters/SmileSad", 0.25))
+        self.assertEqual(encode_float("/abc", 1.0), b"/abc\0\0\0\0,f\0\0" + struct.pack(">f", 1.0))
+
+    def test_combine_ranges(self):
+        from palbuddy.config import MergedParam
+        m = MergedParam("SmileSad", "smile", "sad", -1.0, 1.0)
+        self.assertEqual(m.combine({"smile": 1.0, "sad": 0.0}), 1.0)
+        self.assertEqual(m.combine({"smile": 0.0, "sad": 1.0}), -1.0)
+        self.assertEqual(m.combine({"smile": 0.0, "sad": 0.0}), 0.0)
+        self.assertAlmostEqual(m.combine({"smile": 0.3, "sad": 0.1}), 0.2)
+        two = MergedParam("SmileSad", "smile", "sad", 0.0, 2.0)
+        self.assertEqual(two.combine({"smile": 0.0, "sad": 1.0}), 0.0)
+        self.assertEqual(two.combine({}), 1.0)
+        self.assertEqual(two.combine({"smile": 0.5}), 1.5)
+        self.assertEqual(two.neutral, 1.0)
+        self.assertTrue(two.beyond_sync_range)
+        half = MergedParam("X", "smile", None, 0.0, 1.0)
+        self.assertEqual(half.combine({"smile": 1.0}), 1.0)
+        self.assertEqual(half.combine({"smile": 0.0}), 0.5)
+        flipped = MergedParam("X", "smile", "sad", 1.0, -1.0)  # reversed range is allowed
+        self.assertEqual(flipped.combine({"smile": 1.0}), -1.0)
+
+    def test_config_roundtrip_and_validation(self):
+        from palbuddy.config import MergedParam
+        cfg = Config(classes=[ExpressionClass("neutral"), ExpressionClass("smile"), ExpressionClass("sad")],
+                     merged_params=[MergedParam("SmileSad", "smile", "sad", 0.0, 2.0)])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.json")
+            cfg.save(path)
+            again = Config.load(path)
+        self.assertEqual(again.merged_params[0], cfg.merged_params[0])
+        self.assertEqual(again.validate(), [])
+        cfg.merged_params = [MergedParam("bad name", "smile", "nope", 1.0, 1.0), MergedParam("Empty")]
+        problems = cfg.validate()
+        self.assertEqual(len(problems), 4, problems)
+
+    def test_engine_sends_merged_over_osc(self):
+        from palbuddy.config import MergedParam
+        rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        rx.bind(("127.0.0.1", 0))
+        rx.settimeout(3)
+        self.addCleanup(rx.close)
+        raw = {"value": np.array([0.9, 0.0, 0.0], np.float32)}
+
+        class FakeRuntime:
+            def activate(self): pass
+            def release(self): pass
+            def warmup(self): pass
+            def describe(self): return "fake"
+            def predict(self, sample): return raw["value"]
+
+        cfg = Config(face_port=0, eye_port=0, vrcft_port=0, osc_port=rx.getsockname()[1],
+                     classes=[ExpressionClass("neutral"), ExpressionClass("smile", max_power=0.5),
+                              ExpressionClass("sad", max_power=0.5)],
+                     merged_params=[MergedParam("SmileSad", "smile", "sad", -1.0, 1.0),
+                                    MergedParam("Mood02", "smile", "sad", 0.0, 2.0),
+                                    MergedParam("Off", "smile", None, enabled=False)])
+        engine = Engine(cfg).start()
+        self.addCleanup(engine.stop)
+        engine._make_runtime = lambda: FakeRuntime()
+        engine.start_inference()
+
+        def latest(after_push):
+            got = {}
+            end = time.time() + 3
+            while time.time() < end and len(got) < 2:
+                after_push()
+                try:
+                    addr, v = decode_osc(rx.recv(256))
+                    got[addr.rsplit("/", 1)[1]] = v
+                except socket.timeout:
+                    break
+            return got
+
+        push = lambda: engine.hub.push(neural(1.0), neural(1.0))  # noqa: E731
+        raw["value"] = np.array([0.9, 0.5, 0.0], np.float32)  # smile full (max_power 0.5)
+        self.assertTrue(wait_for(lambda: engine.last_merged.get("SmileSad") == 1.0 or push()))
+        got = latest(push)
+        self.assertAlmostEqual(got["SmileSad"], 1.0, places=4)
+        self.assertAlmostEqual(got["Mood02"], 2.0, places=4)
+        self.assertNotIn("Off", got)
+        raw["value"] = np.array([0.9, 0.0, 0.25], np.float32)  # half sad
+        self.assertTrue(wait_for(lambda: abs(engine.last_merged.get("SmileSad", 0) + 0.5) < 1e-6 or push()))
+        engine.stop_inference()  # leaves the parameters at neutral
+        tail = []
+        try:
+            while True:
+                tail.append(decode_osc(rx.recv(256)))
+        except socket.timeout:
+            pass
+        final = dict((a.rsplit("/", 1)[1], v) for a, v in tail)
+        self.assertEqual(final["SmileSad"], 0.0)
+        self.assertEqual(final["Mood02"], 1.0)
+
+
 class ConfigTests(unittest.TestCase):
     def test_roundtrip(self):
         cfg = default_config()

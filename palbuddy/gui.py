@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
-from .config import ExpressionClass
+from .config import RANGE_PRESETS, ExpressionClass, MergedParam, merged_param_problems
 from .datasets import frame_count
 from .engine import dataset_files
 from .frames import decode_camera
@@ -122,6 +122,112 @@ class ClassDialog(tk.Toplevel):
         self.destroy()
 
 
+class MergedDialog(tk.Toplevel):
+    """Edit one merged parameter: name, positive/negative class, output range."""
+
+    def __init__(self, app, param=None):
+        super().__init__(app.root)
+        self.app = app
+        t = app.t
+        self.title(t("merged_dialog"))
+        self.transient(app.root)
+        self.result = None
+        param = param or MergedParam("", None, None, -1.0, 1.0, True)
+        classes = [t("none")] + [c.name for c in app.cfg.classes]
+        self.none_label = t("none")
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+        self.name = tk.StringVar(value=param.name)
+        self.pos = tk.StringVar(value=param.positive or self.none_label)
+        self.neg = tk.StringVar(value=param.negative or self.none_label)
+        self.min = tk.StringVar(value="%g" % param.out_min)
+        self.max = tk.StringVar(value="%g" % param.out_max)
+        self.enabled = tk.BooleanVar(value=param.enabled)
+        self.preset_labels = {k: t("range_" + k.replace("..", "_").replace("-", "m")) for k in RANGE_PRESETS}
+        self.preset_labels["custom"] = t("range_custom")
+        current = next((k for k, v in RANGE_PRESETS.items() if v == (param.out_min, param.out_max)), "custom")
+        self.preset = tk.StringVar(value=self.preset_labels[current])
+
+        rows = ((t("col_name"), ttk.Entry(frm, textvariable=self.name, width=28)),
+                (t("merged_pos"), ttk.Combobox(frm, textvariable=self.pos, values=classes, state="readonly", width=26)),
+                (t("merged_neg"), ttk.Combobox(frm, textvariable=self.neg, values=classes, state="readonly", width=26)))
+        for i, (label, widget) in enumerate(rows):
+            ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=2)
+            widget.grid(row=i, column=1, columnspan=3, sticky="w", pady=2)
+        ttk.Label(frm, text=t("merged_range")).grid(row=3, column=0, sticky="w", pady=2)
+        preset_box = ttk.Combobox(frm, textvariable=self.preset, values=list(self.preset_labels.values()),
+                                  state="readonly", width=26)
+        preset_box.grid(row=3, column=1, columnspan=3, sticky="w")
+        preset_box.bind("<<ComboboxSelected>>", lambda e: self._apply_preset())
+        ttk.Label(frm, text="min").grid(row=4, column=0, sticky="e")
+        self.min_entry = ttk.Entry(frm, textvariable=self.min, width=8)
+        self.min_entry.grid(row=4, column=1, sticky="w")
+        ttk.Label(frm, text="max").grid(row=4, column=2, sticky="e")
+        self.max_entry = ttk.Entry(frm, textvariable=self.max, width=8)
+        self.max_entry.grid(row=4, column=3, sticky="w")
+        ttk.Checkbutton(frm, text=t("merged_enabled"), variable=self.enabled).grid(
+            row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.preview = ttk.Label(frm, text="", foreground="#666", wraplength=380, justify="left")
+        self.preview.grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        for var in (self.pos, self.neg, self.min, self.max):
+            var.trace_add("write", lambda *a: self._update_preview())
+        btns = ttk.Frame(frm)
+        btns.grid(row=7, column=0, columnspan=4, sticky="e", pady=(8, 0))
+        ttk.Button(btns, text="OK", command=self.ok).pack(side="left", padx=4)
+        ttk.Button(btns, text=t("cancel"), command=self.destroy).pack(side="left")
+        self._apply_preset(initial=True)
+        self.grab_set()
+        self.wait_window()
+
+    def _preset_key(self):
+        return next(k for k, v in self.preset_labels.items() if v == self.preset.get())
+
+    def _apply_preset(self, initial=False):
+        key = self._preset_key()
+        custom = key == "custom"
+        for e in (self.min_entry, self.max_entry):
+            e.state(["!disabled"] if custom else ["disabled"])
+        if not custom and not initial:
+            lo, hi = RANGE_PRESETS[key]
+            self.min.set("%g" % lo)
+            self.max.set("%g" % hi)
+        self._update_preview()
+
+    def _read(self):
+        side = lambda v: None if v.get() == self.none_label else v.get()  # noqa: E731
+        return MergedParam(self.name.get().strip(), side(self.pos), side(self.neg), float(self.min.get()),
+                           float(self.max.get()), bool(self.enabled.get()))
+
+    def _update_preview(self):
+        t = self.app.t
+        try:
+            m = self._read()
+        except ValueError:
+            self.preview.configure(text="")
+            return
+        text = t("merged_preview") % (m.negative or t("none"), m.out_min, m.neutral, m.positive or t("none"), m.out_max)
+        if m.beyond_sync_range:
+            text += "\n" + t("merged_sync_warning")
+        self.preview.configure(text=text, foreground="#c05000" if m.beyond_sync_range else "#666")
+
+    def ok(self):
+        try:
+            m = self._read()
+        except ValueError:
+            messagebox.showerror(self.app.t("error"), "min / max", parent=self)
+            return
+        problems = merged_param_problems(m, {c.name for c in self.app.cfg.classes})
+        others = [p for p in self.app.cfg.merged_params if p is not self.app._editing_merged]
+        if any(p.name == m.name for p in others):
+            problems.append(self.app.t("merged_duplicate") % m.name)
+        if problems:
+            messagebox.showerror(self.app.t("error"), "\n".join(problems), parent=self)
+            return
+        self.result = m
+        self.destroy()
+
+
 class App:
     def __init__(self, engine):
         self.engine = engine
@@ -150,6 +256,7 @@ class App:
         self._build_live_tab()
         self._build_record_tab()
         self._build_train_tab()
+        self._build_merged_tab()
         self._build_settings_tab()
         self._build_log_tab()
 
@@ -362,6 +469,100 @@ class App:
         self.loss_canvas = tk.Canvas(chart, height=160, bg="white", highlightthickness=0)
         self.loss_canvas.pack(fill="both", expand=True)
         self.loss_canvas.bind("<Configure>", lambda e: self._draw_loss())
+
+    def _build_merged_tab(self):
+        t = self.t
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text=t("tab_merged"))
+        ttk.Label(tab, text=t("merged_help"), foreground="#666", wraplength=940, justify="left").pack(anchor="w")
+        box = ttk.Frame(tab)
+        box.pack(fill="both", expand=True, pady=6)
+        cols = ("pos", "neg", "range", "value")
+        self.merged_tree = ttk.Treeview(box, columns=cols, show="tree headings", selectmode="browse")
+        self.merged_tree.heading("#0", text=t("col_name"))
+        for col, key, width in (("pos", "merged_pos", 150), ("neg", "merged_neg", 150), ("range", "merged_range", 170),
+                                ("value", "merged_value", 120)):
+            self.merged_tree.heading(col, text=t(key))
+            self.merged_tree.column(col, width=width, anchor="w" if col != "value" else "e")
+        self.merged_tree.pack(side="left", fill="both", expand=True)
+        self.merged_tree.bind("<Double-1>", lambda e: self.on_edit_merged())
+        side = ttk.Frame(box)
+        side.pack(side="left", fill="y", padx=6)
+        for key, cmd in (("add", self.on_add_merged), ("edit", self.on_edit_merged), ("remove", self.on_remove_merged)):
+            ttk.Button(side, text=t(key), command=cmd).pack(fill="x", pady=2)
+
+        osc = ttk.LabelFrame(tab, text="OSC", padding=6)
+        osc.pack(fill="x")
+        self.osc_enabled = tk.BooleanVar(value=self.cfg.osc_enabled)
+        self.osc_host = tk.StringVar(value=self.cfg.osc_host)
+        self.osc_port = tk.StringVar(value=str(self.cfg.osc_port))
+        ttk.Checkbutton(osc, text=t("osc_enabled"), variable=self.osc_enabled).pack(side="left")
+        ttk.Label(osc, text=t("osc_target")).pack(side="left", padx=(16, 4))
+        ttk.Entry(osc, textvariable=self.osc_host, width=14).pack(side="left")
+        ttk.Label(osc, text=":").pack(side="left")
+        ttk.Entry(osc, textvariable=self.osc_port, width=6).pack(side="left")
+        ttk.Button(osc, text=t("perf_apply"), command=self.on_apply_osc).pack(side="left", padx=8)
+        self._editing_merged = None
+        self.refresh_merged()
+
+    def refresh_merged(self):
+        t = self.t
+        self.merged_tree.delete(*self.merged_tree.get_children())
+        names = {c.name for c in self.cfg.classes}
+        for i, m in enumerate(self.cfg.merged_params):
+            problems = merged_param_problems(m, names)
+            value = t("merged_off") if not m.enabled else ("! " + problems[0] if problems else "")
+            self.merged_tree.insert("", "end", iid=str(i), text=m.name, values=(
+                m.positive or "-", m.negative or "-", "%g .. %g .. %g" % (m.out_min, m.neutral, m.out_max), value))
+
+    def _update_merged_values(self):
+        values = self.engine.last_merged
+        for i, m in enumerate(self.cfg.merged_params):
+            if m.name in values and self.merged_tree.exists(str(i)):
+                self.merged_tree.set(str(i), "value", "%.3f" % values[m.name])
+
+    def _selected_merged(self):
+        sel = self.merged_tree.selection()
+        return int(sel[0]) if sel else None
+
+    def on_add_merged(self):
+        self._editing_merged = None
+        d = MergedDialog(self)
+        if d.result:
+            self.cfg.merged_params.append(d.result)
+            self.engine.save_config()
+            self.refresh_merged()
+
+    def on_edit_merged(self):
+        i = self._selected_merged()
+        if i is None:
+            return
+        self._editing_merged = self.cfg.merged_params[i]
+        d = MergedDialog(self, self.cfg.merged_params[i])
+        self._editing_merged = None
+        if d.result:
+            self.cfg.merged_params[i] = d.result
+            self.engine.save_config()
+            self.refresh_merged()
+
+    def on_remove_merged(self):
+        i = self._selected_merged()
+        if i is not None:
+            del self.cfg.merged_params[i]
+            self.engine.save_config()
+            self.refresh_merged()
+
+    def on_apply_osc(self):
+        try:
+            port = int(self.osc_port.get())
+            if not 0 < port < 65536:
+                raise ValueError
+        except ValueError:
+            self._error("OSC port")
+            return
+        self.cfg.osc_enabled = bool(self.osc_enabled.get())
+        self.engine.set_osc_target(self.osc_host.get().strip() or "127.0.0.1", port)
+        self.engine.save_config()
 
     def _build_settings_tab(self):
         t = self.t
@@ -657,6 +858,7 @@ class App:
                                      foreground="#c05000" if s["fastcal"] else "#666")
         if s["inferring"]:
             self._update_bars()
+            self._update_merged_values()
         self.root.after(100 if s["inferring"] else 250, self._refresh_status)
 
     def _update_bars(self):
@@ -841,9 +1043,16 @@ class App:
         i = self._selected_class()
         if i is None:
             return
+        old_name = self.cfg.classes[i].name
         d = ClassDialog(self, self.cfg.classes[i])
         if d.result:
             self.cfg.classes[i] = d.result
+            if d.result.name != old_name:  # keep merged parameters pointing at the renamed class
+                for m in self.cfg.merged_params:
+                    if m.positive == old_name:
+                        m.positive = d.result.name
+                    if m.negative == old_name:
+                        m.negative = d.result.name
             self._classes_changed()
 
     def on_remove_class(self):
@@ -870,6 +1079,7 @@ class App:
             self.engine.stop_inference()
         self.engine.save_config()
         self.refresh_classes()
+        self.refresh_merged()
 
     def on_train(self):
         try:

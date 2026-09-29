@@ -39,6 +39,33 @@ STRINGS = {
     "max_infer_rate": ("Max tracking rate (Hz, 0 = every frame)", "최대 추론 빈도 (Hz, 0 = 모든 프레임)"),
     "perf_apply": ("Apply", "적용"),
     "vrcft_module": ("VRCFaceTracking module", "VRCFaceTracking 모듈"),
+    "tab_merged": ("Merged", "병합 파라미터"),
+    "merged_help": ("Combine two trained classes into one custom avatar parameter, sent to VRChat over OSC: "
+                    "value = positive class - negative class (e.g. smile - sad), mapped to the range you pick "
+                    "(-1..1, 0..1, 0..2 or custom). Add a float parameter with the same name to your avatar. "
+                    "Values update while tracking.",
+                    "학습된 두 클래스를 하나의 아바타 파라미터로 합쳐 OSC로 VRChat에 보냅니다: "
+                    "값 = 긍정 클래스 − 부정 클래스 (예: 웃음 − 슬픔), 고른 범위(-1~1, 0~1, 0~2, 직접 입력)로 변환됩니다. "
+                    "아바타에 같은 이름의 float 파라미터를 추가하세요. 트래킹 중에 값이 갱신됩니다."),
+    "merged_dialog": ("Merged parameter", "병합 파라미터"),
+    "merged_pos": ("Positive class (+)", "긍정 클래스 (+)"),
+    "merged_neg": ("Negative class (-)", "부정 클래스 (-)"),
+    "merged_range": ("Range", "범위"),
+    "merged_value": ("Value", "현재 값"),
+    "merged_enabled": ("Enabled", "사용"),
+    "merged_off": ("off", "꺼짐"),
+    "range_m1_1": ("-1 ~ 1 (neutral 0)", "-1 ~ 1 (중앙 0)"),
+    "range_0_1": ("0 ~ 1 (neutral 0.5)", "0 ~ 1 (중앙 0.5)"),
+    "range_0_2": ("0 ~ 2 (neutral 1)", "0 ~ 2 (중앙 1)"),
+    "range_custom": ("custom", "직접 입력"),
+    "merged_preview": ("%s → %g,  neither → %g,  %s → %g", "%s → %g,  둘 다 아님 → %g,  %s → %g"),
+    "merged_sync_warning": ("VRChat syncs float parameters in -1..1; values outside only work locally "
+                            "(unsynced parameter). Otherwise use -1..1 and rescale in the animator.",
+                            "VRChat은 float 파라미터를 -1~1 범위로 동기화합니다. 이 범위를 벗어나는 값은 로컬(동기화 안 함) "
+                            "파라미터에서만 그대로 쓰입니다. 동기화가 필요하면 -1~1로 받고 애니메이터에서 변환하세요."),
+    "merged_duplicate": ("A merged parameter named '%s' already exists.", "'%s' 이름의 병합 파라미터가 이미 있습니다."),
+    "osc_enabled": ("Send merged parameters to VRChat", "병합 파라미터를 VRChat으로 전송"),
+    "osc_target": ("VRChat OSC address", "VRChat OSC 주소"),
     "wrap_sranipal": ("Run the SRanipal module inside Pal Buddy Guy (needed with VRCFT v6)",
                       "SRanipal 모듈을 Pal Buddy Guy 안에서 실행 (VRCFT v6에서 필요)"),
     "max_mode": ("Keep SRanipal's value when it is larger (instead of replacing it)",

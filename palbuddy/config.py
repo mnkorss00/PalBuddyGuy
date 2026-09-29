@@ -6,6 +6,7 @@ Replaces the constants that used to be hand-edited at the top of script.py
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
 
@@ -40,6 +41,46 @@ class ExpressionClass:
     files: List[str] = field(default_factory=list)
     target: Optional[str] = None
     max_power: float = 0.9
+
+
+PARAM_NAME_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+
+# (min, max) presets for merged parameters: negative class -> min, neutral -> centre, positive -> max
+RANGE_PRESETS = {"-1..1": (-1.0, 1.0), "0..1": (0.0, 1.0), "0..2": (0.0, 2.0)}
+
+
+@dataclass
+class MergedParam:
+    """A custom avatar parameter combining two trained classes, sent to VRChat over OSC.
+
+    value = positive class weight - negative class weight   (-1..1, 0 = neither)
+    mapped linearly so that -1 -> out_min, 0 -> the middle, +1 -> out_max.
+    E.g. smile (0..1) and sad (0..1) -> "SmileSad" in -1..1, or 0..2 with neutral at 1.
+    Either class may be empty (e.g. only a positive side).
+    """
+
+    name: str
+    positive: Optional[str] = None
+    negative: Optional[str] = None
+    out_min: float = -1.0
+    out_max: float = 1.0
+    enabled: bool = True
+
+    def combine(self, weights):
+        """weights: {class name: weight 0..1} -> output value."""
+        pos = weights.get(self.positive, 0.0) if self.positive else 0.0
+        neg = weights.get(self.negative, 0.0) if self.negative else 0.0
+        c = min(1.0, max(-1.0, pos - neg))
+        return self.out_min + (c + 1.0) / 2.0 * (self.out_max - self.out_min)
+
+    @property
+    def neutral(self):
+        return (self.out_min + self.out_max) / 2.0
+
+    @property
+    def beyond_sync_range(self):
+        """VRChat syncs float parameters as -1..1; larger values only work locally."""
+        return min(self.out_min, self.out_max) < -1.0 or max(self.out_min, self.out_max) > 1.0
 
 
 @dataclass
@@ -102,6 +143,12 @@ class Config:
 
     classes: List[ExpressionClass] = field(default_factory=list)
 
+    # Merged parameters (sent straight to VRChat over OSC, see palbuddy/osc.py)
+    merged_params: List[MergedParam] = field(default_factory=list)
+    osc_enabled: bool = True
+    osc_host: str = "127.0.0.1"
+    osc_port: int = 9000
+
     # ---------------------------------------------------------------- helpers
     @property
     def num_classes(self):
@@ -135,6 +182,9 @@ class Config:
                     problems.append("Class '%s' has an unknown target shape '%s'." % (c.name, c.target))
             if c.max_power <= 0:
                 problems.append("Class '%s' needs max_power > 0." % c.name)
+        names = {c.name for c in self.classes}
+        for m in self.merged_params:
+            problems.extend(merged_param_problems(m, names))
         return problems
 
     # ---------------------------------------------------------------- io
@@ -148,9 +198,13 @@ class Config:
         class_fields = set(ExpressionClass.__dataclass_fields__)
         classes = [ExpressionClass(**{k: v for k, v in c.items() if k in class_fields})
                    for c in data.pop("classes", []) if isinstance(c, dict) and "name" in c]
+        merged_fields = set(MergedParam.__dataclass_fields__)
+        merged = [MergedParam(**{k: v for k, v in m.items() if k in merged_fields})
+                  for m in data.pop("merged_params", []) if isinstance(m, dict) and "name" in m]
         known = set(cls.__dataclass_fields__)
         cfg = cls(**{k: v for k, v in data.items() if k in known})
         cfg.classes = classes
+        cfg.merged_params = merged
         return cfg
 
     def save(self, path=DEFAULT_CONFIG_PATH):
@@ -167,6 +221,21 @@ class Config:
             return cfg
         with open(path, "r", encoding="utf-8") as f:
             return cls.from_dict(json.load(f))
+
+
+def merged_param_problems(m, class_names):
+    """Reasons a merged parameter can't be used (empty list = fine)."""
+    problems = []
+    if not PARAM_NAME_RE.match(m.name or ""):
+        problems.append("Merged parameter '%s': use letters, digits, _ . / - only." % m.name)
+    if not m.positive and not m.negative:
+        problems.append("Merged parameter '%s' needs a positive or a negative class." % m.name)
+    for side in (m.positive, m.negative):
+        if side and side not in class_names:
+            problems.append("Merged parameter '%s' uses unknown class '%s'." % (m.name, side))
+    if m.out_min == m.out_max:
+        problems.append("Merged parameter '%s' needs different min and max values." % m.name)
+    return problems
 
 
 def default_config():

@@ -24,6 +24,9 @@ HELP = """commands:
   stop               stop inference / training / recording
   arch [standard|lite]  model size used for the next training
   vrcft [status|install|uninstall]  VRCFaceTracking v6 module
+  merged                             list merged parameters (sent to VRChat over OSC)
+  merged add NAME POS NEG [MIN MAX]  e.g. "merged add SmileSad smile sad -1 1" (use - for no class)
+  merged remove NAME
   perf [engine auto|onnx|pytorch] [device auto|cpu|gpu] [threads N] [int8 on|off] [rate HZ]
        [priority above_normal|normal|below_normal|idle] [affinity all|ecores] [eco on|off]
                      show / change inference performance settings
@@ -137,6 +140,32 @@ def run_cli(engine):
                     for m in st["sranipal"]:
                         print("SRanipal module: %s (%s)" % (m["name"], "wrapped" if m["disabled"] else "standalone"))
                     print("connected module protocol: %s" % engine.vrcft.protocol)
+            elif cmd == "merged":
+                from .config import MergedParam, merged_param_problems
+                c = engine.cfg
+                words = arg.split()
+                if words[:1] == ["add"] and len(words) in (4, 6):
+                    lo, hi = (float(words[4]), float(words[5])) if len(words) == 6 else (-1.0, 1.0)
+                    m = MergedParam(words[1], None if words[2] == "-" else words[2],
+                                    None if words[3] == "-" else words[3], lo, hi)
+                    problems = merged_param_problems(m, {x.name for x in c.classes})
+                    if any(p.name == m.name for p in c.merged_params):
+                        problems.append("'%s' already exists" % m.name)
+                    if problems:
+                        raise ValueError("; ".join(problems))
+                    c.merged_params.append(m)
+                    engine.save_config()
+                elif words[:1] == ["remove"] and len(words) == 2:
+                    c.merged_params = [m for m in c.merged_params if m.name != words[1]]
+                    engine.save_config()
+                elif words:
+                    raise ValueError("usage: merged | merged add NAME POS NEG [MIN MAX] | merged remove NAME")
+                for m in c.merged_params:
+                    print("  %-16s + %-12s - %-12s  %g .. %g .. %g%s  now %s" % (
+                        m.name, m.positive or "-", m.negative or "-", m.out_min, m.neutral, m.out_max,
+                        "" if m.enabled else " (off)", "%.3f" % engine.last_merged[m.name]
+                        if m.name in engine.last_merged else "-"))
+                print("  OSC %s -> %s:%d" % ("on" if c.osc_enabled else "off", c.osc_host, c.osc_port))
             elif cmd == "arch":
                 if arg:
                     if arg not in ("standard", "lite"):

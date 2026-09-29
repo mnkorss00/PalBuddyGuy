@@ -15,9 +15,10 @@ import time
 import numpy as np
 
 from . import onnx_runtime
-from .config import Config
+from .config import Config, merged_param_problems
 from .datasets import Recorder, convert_legacy_pickles
 from .frames import FrameHub, ProxyClient, RateMeter, SRanipalReceiver
+from .osc import OscSender
 from .vrcft import VRCFTServer
 
 log = logging.getLogger(__name__)
@@ -54,6 +55,8 @@ class Engine:
         self.process_cpu_pct = 0.0
         self.last_raw = None  # np.ndarray of raw outputs
         self.last_out = {}  # class index -> normalized value sent to VRCFT
+        self.last_merged = {}  # merged parameter name -> value sent over OSC
+        self.osc = None
         self._smoothed = {}
 
     # ------------------------------------------------------------ lifecycle
@@ -68,7 +71,25 @@ class Engine:
         self.vrcft = VRCFTServer(cfg.bind_host, cfg.vrcft_port)
         self.vrcft.max_mode = cfg.vrcft_override_mode == "max"
         self.vrcft.start()
+        self.osc = OscSender(cfg.osc_host, cfg.osc_port)
         return self
+
+    def set_osc_target(self, host, port):
+        self.cfg.osc_host, self.cfg.osc_port = host, int(port)
+        old, self.osc = self.osc, OscSender(host, int(port))
+        if old is not None:
+            old.close()
+
+    def active_merged_params(self):
+        """Enabled merged parameters whose settings are valid."""
+        names = {c.name for c in self.cfg.classes}
+        return [m for m in self.cfg.merged_params if m.enabled and not merged_param_problems(m, names)]
+
+    def _send_merged_neutral(self):
+        if self.osc is not None and self.cfg.osc_enabled:
+            for m in self.active_merged_params():
+                self.osc.send_parameter(m.name, m.neutral)
+        self.last_merged = {}
 
     @property
     def device(self):
@@ -90,6 +111,8 @@ class Engine:
         for part in (self.source, self.vrcft):
             if part is not None:
                 part.stop()
+        if self.osc is not None:
+            self.osc.close()
 
     def save_config(self):
         if self.config_path:
@@ -476,22 +499,38 @@ class Engine:
                 next_due = max(next_due + infer_interval, time.monotonic())
             self.last_raw = raw
 
+            # per-class weight 0..1 (raw / max_power), smoothed; VRCFT gets 2w-1 in -1..1
             alpha = self.cfg.smoothing
-            out, pairs = {}, []
-            for idx, target, max_power in self.cfg.targets():
-                v = normalize(raw[idx], max_power)
+            classes = self.cfg.classes
+            weights = {}
+            for idx, c in enumerate(classes):
+                if idx >= len(raw):
+                    break
+                w = (normalize(raw[idx], c.max_power) + 1.0) / 2.0
                 if 0.0 < alpha < 1.0:
-                    prev = self._smoothed.get(idx, v)
-                    v = prev * alpha + v * (1.0 - alpha)
-                    self._smoothed[idx] = v
-                out[idx] = v
-                pairs.append((target, v))
+                    prev = self._smoothed.get(idx, w)
+                    w = prev * alpha + w * (1.0 - alpha)
+                    self._smoothed[idx] = w
+                weights[c.name] = w
+            out, pairs = {}, []
+            for idx, target, _ in self.cfg.targets():
+                if classes[idx].name in weights:
+                    v = weights[classes[idx].name] * 2.0 - 1.0
+                    out[idx] = v
+                    pairs.append((target, v))
             self.last_out = out
+            merged = {m.name: m.combine(weights) for m in self.active_merged_params()}
+            self.last_merged = merged
             now = time.monotonic()
-            if pairs and now - last_send >= min_interval:
-                self.vrcft.send_targets(pairs)
+            if now - last_send >= min_interval:
+                if pairs:
+                    self.vrcft.send_targets(pairs)
+                if merged and self.cfg.osc_enabled:
+                    for name, value in merged.items():
+                        self.osc.send_parameter(name, value)
                 last_send = now
         runtime.release()
+        self._send_merged_neutral()  # leave merged parameters at neutral, not frozen
         if self.vrcft is not None:
             self.vrcft.clear()  # v6 module: fall back to plain SRanipal right away
         self.infer_backend = None
