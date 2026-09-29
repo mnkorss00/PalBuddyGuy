@@ -661,6 +661,79 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(Config().process_priority, "below_normal")
 
 
+class RegressionTests(unittest.TestCase):
+    """Bugs found in the final test pass."""
+
+    def test_config_ignores_unknown_keys(self):
+        cfg = Config.from_dict({"epochs": 3, "future_key": 1, "classes": [
+            {"name": "n", "files": ["a.mmap"], "extra": True}, {"no_name": 1}, "garbage"]})
+        self.assertEqual(cfg.epochs, 3)
+        self.assertEqual([c.name for c in cfg.classes], ["n"])
+
+    def test_corrupt_config_is_moved_aside(self):
+        import subprocess
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "config.json")
+        with open(path, "w") as f:
+            f.write("{not json")
+        r = subprocess.run([sys.executable, "-m", "palbuddy", "--cli", "--config", path], input="quit\n",
+                           capture_output=True, text=True, timeout=120,
+                           cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        self.assertEqual(r.returncode, 0, r.stderr[-500:])
+        self.assertTrue(any(f.startswith("config.json.broken-") for f in os.listdir(tmp.name)))
+        Config.load(path)  # a fresh default config was written
+
+    def _tiny_cfg(self, tmp):
+        make = np.random.default_rng(0)
+        for n, off in (("a", 0.0), ("b", 1.0)):
+            mm = np.memmap(os.path.join(tmp, n + ".mmap"), np.float32, "w+", shape=(32, 128, 20, 20))
+            mm[:] = make.normal(off, .3, mm.shape)
+            mm.flush()
+            del mm
+        return Config(dataset_folder=tmp, epochs=1, batch_size=64, model_arch="lite", mixed_precision=False,
+                      classes=[ExpressionClass("n", ["a.mmap"]), ExpressionClass("s", ["b.mmap"], "JawOpen")])
+
+    def test_training_leaves_no_loader_threads(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        train(self._tiny_cfg(tmp.name), log_fn=lambda *a: None, device=torch.device("cpu"))
+        self.assertFalse([t for t in threading.enumerate() if t.name.startswith("batch-loader")])
+
+    def test_loader_error_surfaces_instead_of_hanging(self):
+        from palbuddy import trainer as T
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        original = T.BatchSampler.sample
+        T.BatchSampler.sample = lambda self: (_ for _ in ()).throw(OSError("disk gone"))
+        try:
+            result = {}
+            th = threading.Thread(target=lambda: result.update(
+                e=self.assertRaises(OSError, train, self._tiny_cfg(tmp.name), log_fn=lambda *a: None,
+                                    device=torch.device("cpu"))))
+            th.start()
+            th.join(60)
+            self.assertFalse(th.is_alive(), "training hung on a loader error")
+        finally:
+            T.BatchSampler.sample = original
+        self.assertFalse([t for t in threading.enumerate() if t.name.startswith("batch-loader")])
+
+    def test_install_while_vrcft_holds_the_dll(self):
+        from palbuddy import vrcft_install
+        import shutil
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = Config(vrcft_custom_libs=tmp.name)
+        original = shutil.copy2
+        shutil.copy2 = lambda *a, **k: (_ for _ in ()).throw(PermissionError("in use"))
+        try:
+            with self.assertRaises(vrcft_install.VRCFTRunningError) as cm:
+                vrcft_install.install(cfg)
+            self.assertIn("Close VRCFaceTracking", str(cm.exception))
+        finally:
+            shutil.copy2 = original
+
+
 class ConfigTests(unittest.TestCase):
     def test_roundtrip(self):
         cfg = default_config()

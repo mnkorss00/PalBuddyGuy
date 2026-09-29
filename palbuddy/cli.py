@@ -74,7 +74,7 @@ def run_cli(engine):
                     print("  tracking %.0f fps, %.1f ms/frame, %s, process CPU %.0f%%" % (
                         s["infer_fps"], s["latency_ms"], s["infer_backend"], s["process_cpu"]))
                 print("  vrcft %s  device %s  inferring %s  model %s" % (
-                    "connected" if s["vrcft"]["connected"] else "disconnected", s["device"], s["inferring"],
+                    "connected" if s["vrcft"]["connected"] else "disconnected", s["device"] or "-", s["inferring"],
                     "loaded" if s["model_loaded"] else "-"))
             elif cmd == "swap":
                 engine.set_swapped(not engine.cfg.swapped)
@@ -199,6 +199,18 @@ def show_fatal(message):
         pass
 
 
+def show_warning(message):
+    try:
+        import tkinter
+        from tkinter import messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showwarning("Pal Buddy Guy", message)
+        root.destroy()
+    except Exception:
+        pass
+
+
 def setup_logging(verbose, config_path):
     level = logging.DEBUG if verbose else logging.INFO
     fmt = logging.Formatter("%(asctime)s %(levelname).1s %(message)s", "%H:%M:%S")
@@ -234,11 +246,13 @@ def main(argv=None):
     try:
         cfg = Config.load(args.config)
     except Exception as e:
-        log.exception("config error")
-        msg = "Could not read %s:\n%s" % (args.config, e)
+        # keep the broken file for the user, start with defaults instead of refusing to start
+        backup = "%s.broken-%s" % (args.config, time.strftime("%Y%m%d-%H%M%S"))
+        os.replace(args.config, backup)
+        log.error("Could not read %s (%s); moved it to %s and started with default settings", args.config, e, backup)
+        cfg = Config.load(args.config)
         if gui:
-            show_fatal(msg)
-        return 1
+            show_warning("config.json could not be read and was moved to\n%s\nDefault settings are used." % backup)
     for problem in cfg.validate():
         log.warning(problem)
     from . import system

@@ -86,8 +86,23 @@ def status(cfg):
     }
 
 
+class VRCFTRunningError(RuntimeError):
+    pass
+
+
+def _locked(e):
+    return VRCFTRunningError("A file is in use (%s). Close VRCFaceTracking, then try again." % e)
+
+
 def install(cfg):
     """Returns a list of human-readable steps that were done."""
+    try:
+        return _install(cfg)
+    except PermissionError as e:
+        raise _locked(e) from e
+
+
+def _install(cfg):
     missing = [f for f in MODULE_FILES if not os.path.exists(os.path.join(PREBUILT_DIR, f))]
     if missing:
         raise FileNotFoundError("Prebuilt module files missing in %s: %s" % (PREBUILT_DIR, ", ".join(missing)))
@@ -122,6 +137,13 @@ def install(cfg):
 
 
 def uninstall(cfg):
+    try:
+        return _uninstall(cfg)
+    except PermissionError as e:
+        raise _locked(e) from e
+
+
+def _uninstall(cfg):
     libs = custom_libs_dir(cfg)
     target = os.path.join(libs, MODULE_ID)
     steps = []

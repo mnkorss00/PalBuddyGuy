@@ -72,9 +72,13 @@ def main():
             img[:100] = decode_camera(hub.cameras["eye"])
         if hub.cameras["face"] is not None:
             img[100:] = decode_camera(hub.cameras["face"], flipped=True)
-        cv2.imshow("PalBuddyGuy proxy", cv2.resize(img, (600, 600), interpolation=cv2.INTER_NEAREST))
-        cv2.waitKey(33)
-        shown = True
+        try:
+            cv2.imshow("PalBuddyGuy proxy", cv2.resize(img, (600, 600), interpolation=cv2.INTER_NEAREST))
+            cv2.waitKey(33)
+            shown = True
+        except cv2.error as e:  # e.g. opencv-python-headless or no display
+            log.warning("Camera window unavailable (%s); continuing without it", e)
+            state["image"] = False
 
     receiver.stop()
     server.stop()

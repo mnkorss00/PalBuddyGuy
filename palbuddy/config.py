@@ -84,7 +84,8 @@ class Config:
     # "auto": ONNX Runtime if installed, else PyTorch. ONNX Runtime is faster on the
     # CPU (int8) and tracking with it never loads PyTorch (~500 MB less RAM).
     infer_engine: str = "auto"  # "auto", "onnx" or "pytorch"
-    infer_device: str = "auto"  # "auto" (GPU if available), "cpu" or "gpu"
+    # CPU by default: int8 inference costs ~1/3 of one core and leaves the GPU to VR
+    infer_device: str = "cpu"  # "cpu", "auto" (GPU if available) or "gpu"
     infer_threads: int = 1  # CPU threads for inference; more = lower latency but more total CPU
     infer_int8: bool = True  # int8-quantize the linear layers when inferring on the CPU
     max_infer_rate: float = 0.0  # Hz cap for running the network, 0 = every new frame
@@ -142,9 +143,12 @@ class Config:
 
     @classmethod
     def from_dict(cls, data):
+        """Unknown keys (from newer/older versions or hand edits) are ignored."""
         data = dict(data)
-        classes = [ExpressionClass(**c) for c in data.pop("classes", [])]
-        known = {f for f in cls.__dataclass_fields__}
+        class_fields = set(ExpressionClass.__dataclass_fields__)
+        classes = [ExpressionClass(**{k: v for k, v in c.items() if k in class_fields})
+                   for c in data.pop("classes", []) if isinstance(c, dict) and "name" in c]
+        known = set(cls.__dataclass_fields__)
         cfg = cls(**{k: v for k, v in data.items() if k in known})
         cfg.classes = classes
         return cfg

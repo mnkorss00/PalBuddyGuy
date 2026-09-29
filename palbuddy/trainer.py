@@ -171,28 +171,34 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
 
     # one "epoch" = as many samples as the original: 2048 frames per class
     steps = max(1, (2048 * cfg.num_classes) // cfg.batch_size)
-    sampler = BatchSampler(recordings, cfg.batch_size, channels=channels)
+    # one sampler (and RNG) per loader thread: numpy Generators aren't thread safe
+    seeds = np.random.SeedSequence().spawn(2)
     q = queue.Queue(maxsize=6)
     producer_stop = threading.Event()
 
-    def producer():
+    def put(item):
+        while not producer_stop.is_set():
+            try:
+                q.put(item, timeout=0.2)
+                return
+            except queue.Full:
+                pass
+
+    def producer(seed):
         pin = device.type == "cuda"
+        sampler = BatchSampler(recordings, cfg.batch_size, seed=seed, channels=channels)
         try:
             while not producer_stop.is_set():
                 x, y = sampler.sample()
                 x, y = torch.from_numpy(x), torch.from_numpy(y)
                 if pin:
                     x, y = x.pin_memory(), y.pin_memory()
-                while not producer_stop.is_set():
-                    try:
-                        q.put((x, y), timeout=0.2)
-                        break
-                    except queue.Full:
-                        pass
+                put((x, y))
         except Exception as e:  # surface loader errors in the training thread
-            q.put(e)
+            put(e)
 
-    workers = [threading.Thread(target=producer, daemon=True, name="batch-loader-%d" % i) for i in range(2)]
+    workers = [threading.Thread(target=producer, args=(seeds[i],), daemon=True, name="batch-loader-%d" % i)
+               for i in range(2)]
     for w in workers:
         w.start()
 
@@ -236,6 +242,8 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
                         elapsed=time.monotonic() - start, epoch_done=True, **val)
     finally:
         producer_stop.set()
+        for w in workers:
+            w.join(timeout=5)
     model.eval()
     metrics = getattr(model, "val_metrics", None)
     if metrics:

@@ -8,10 +8,10 @@ rem  found) and the other packages, and offers a desktop shortcut.
 rem  Every later run: starts the GUI immediately, without a console window.
 rem
 rem  To reinstall from scratch, delete the .venv folder and run this again.
+rem  (This file is plain ASCII on purpose: UTF-8 batch files can misbehave.)
 rem ==========================================================================
 setlocal EnableExtensions
 cd /d "%~dp0"
-chcp 65001 >nul
 title Pal Buddy Guy
 
 set "APPDIR=%~dp0"
@@ -23,42 +23,36 @@ if exist "%VENV%\.installed" if exist "%PYW%" goto run
 
 echo.
 echo  ==============================================
-echo    Pal Buddy Guy - 첫 실행 설정 / first-time setup
+echo    Pal Buddy Guy - first-time setup
 echo  ==============================================
 echo.
 
 rem ---------------------------------------------------------------- Python
-set "CHECK=import sys, tkinter; sys.exit(0 if sys.version_info >= (3, 9) else 1)"
+rem Prefer versions PyTorch surely has wheels for; "py -3" alone picks the newest.
+set "CHECK=import sys, tkinter; sys.exit(0 if (3, 9) <= sys.version_info[:2] <= (3, 13) else 1)"
 set "SYS_PY="
+call :probe py -3.12
+call :probe py -3.11
+call :probe py -3.13
+call :probe py -3.10
+call :probe python
+if defined SYS_PY goto have_python
 
-for /f "delims=" %%i in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set "SYS_PY=%%i"
-if not defined SYS_PY goto try_python
-"%SYS_PY%" -c "%CHECK%" >nul 2>&1
-if not errorlevel 1 goto have_python
-
-:try_python
-set "SYS_PY="
-for /f "delims=" %%i in ('python -c "import sys; print(sys.executable)" 2^>nul') do set "SYS_PY=%%i"
-if not defined SYS_PY goto no_python
-"%SYS_PY%" -c "%CHECK%" >nul 2>&1
-if not errorlevel 1 goto have_python
-
-:no_python
-echo  Python 3.9 이상을 찾을 수 없습니다. / Python 3.9+ was not found.
+echo  A suitable Python (3.10 - 3.13, with tkinter) was not found.
 where winget >nul 2>&1
 if errorlevel 1 goto manual_python
-choice /C YN /M " winget으로 Python 3.12를 설치할까요? / Install Python 3.12 with winget"
+choice /C YN /M " Install Python 3.12 with winget"
 if errorlevel 2 goto manual_python
 winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements
 set "SYS_PY=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
 if exist "%SYS_PY%" goto have_python
-echo  설치가 끝나면 이 파일을 다시 실행해 주세요. / Please run this file again after the install finishes.
+echo  Please run this file again after the Python install finishes.
 pause
 exit /b 1
 
 :manual_python
-echo  https://www.python.org/downloads/ 에서 Python을 설치한 뒤 다시 실행하세요.
-echo  (설치 화면에서 "Add python.exe to PATH"를 체크하세요)
+echo  Install Python 3.12 from https://www.python.org/downloads/ and run this file again.
+echo  (Tick "Add python.exe to PATH" in the installer.)
 start "" "https://www.python.org/downloads/windows/"
 pause
 exit /b 1
@@ -68,7 +62,7 @@ echo  Python: %SYS_PY%
 
 rem ---------------------------------------------------------------- venv
 if exist "%PY%" goto venv_ready
-echo  가상환경 생성 중... / creating environment...
+echo  Creating the environment...
 "%SYS_PY%" -m venv "%VENV%"
 if errorlevel 1 goto fail
 :venv_ready
@@ -87,10 +81,10 @@ if not errorlevel 1 set "TORCH_INDEX=https://download.pytorch.org/whl/cu128"
 
 :install_torch
 echo  GPU: %GPU%
-echo  PyTorch 설치 중 (약 2~3GB, 몇 분 걸립니다)... / installing PyTorch...
+echo  Installing PyTorch (2-3 GB download, this takes a few minutes)...
 "%PY%" -m pip install torch --index-url %TORCH_INDEX%
 if errorlevel 1 goto fail
-echo  나머지 패키지 설치 중... / installing other packages...
+echo  Installing the other packages...
 "%PY%" -m pip install -r "%APPDIR%requirements.txt"
 if errorlevel 1 goto fail
 
@@ -106,7 +100,7 @@ echo ok> "%VENV%\.installed"
 
 rem ---------------------------------------------------------------- shortcut
 echo.
-choice /C YN /M " 바탕화면에 바로가기를 만들까요? / Create a desktop shortcut"
+choice /C YN /M " Create a desktop shortcut"
 if errorlevel 2 goto run
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$s = (New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop') + '\Pal Buddy Guy.lnk');" ^
@@ -120,7 +114,17 @@ exit /b 0
 
 :fail
 echo.
-echo  설치 중 오류가 발생했습니다. 위 메시지를 확인하세요.
 echo  Setup failed - see the messages above. Delete the .venv folder to start over.
 pause
 exit /b 1
+
+rem ---------------------------------------------------------------- helpers
+rem call :probe <python launcher and args> - sets SYS_PY if it is a suitable Python
+:probe
+if defined SYS_PY exit /b 0
+set "CAND="
+for /f "delims=" %%i in ('%* -c "import sys; print(sys.executable)" 2^>nul') do set "CAND=%%i"
+if not defined CAND exit /b 0
+"%CAND%" -c "%CHECK%" >nul 2>&1
+if not errorlevel 1 set "SYS_PY=%CAND%"
+exit /b 0

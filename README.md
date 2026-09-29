@@ -78,7 +78,7 @@ Tracking runs the network on every new frame, about 60 times a second. These set
 | Setting | What it does |
 |---|---|
 | **Engine** | *ONNX Runtime* is the fastest on the CPU and never loads PyTorch while tracking, which saves hundreds of MB of RAM. *auto* uses it when it's installed; the launcher installs it. When you save a model, an `.onnx` copy (plus an int8 version) is written next to the `.pt`, and it is refreshed automatically if the `.pt` is newer. |
-| **Run on** | *auto* uses the GPU if there is one. With ONNX Runtime that means DirectML (`onnxruntime-directml`), which works on NVIDIA, **AMD** and Intel GPUs. *CPU* leaves the GPU entirely to VR. *GPU* forces the GPU. |
+| **Run on** | *CPU* (default) leaves the GPU entirely to VR; int8 inference costs about a third of one core. *auto* uses the GPU if there is one. With ONNX Runtime that means DirectML (`onnxruntime-directml`), which works on NVIDIA, **AMD** and Intel GPUs. *GPU* forces the GPU. |
 | **CPU threads** | Default 1. More threads cut latency but **increase** total CPU use. |
 | **int8 quantization** | On the CPU, uses int8 weights for the big linear layer: about 2–3× faster, with the same model and no retraining. The output difference is about 0.003. |
 | **Max tracking rate** | For example 30 Hz. Skips frames in between and halves the work. Combine it with *Smoothing* on the Live tab. |
