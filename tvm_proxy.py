@@ -67,6 +67,7 @@ def main():
                 shown = False
             time.sleep(0.1)
             continue
+        hub.want_cameras()
         img = np.zeros((200, 200), dtype=np.uint8)
         if hub.cameras["eye"] is not None:
             img[:100] = decode_camera(hub.cameras["eye"])

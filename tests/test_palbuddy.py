@@ -93,6 +93,7 @@ class ReceiverTests(unittest.TestCase):
         return socket.create_connection(("127.0.0.1", self.rx.ports[index]))
 
     def test_pairs_eye_and_face(self):
+        self.hub.want_cameras()  # as the GUI does while the preview is visible
         face, eye = self.connect(0), self.connect(1)
         eye.sendall(packet(neural(1.0)) + packet(np.zeros(CAMERA_BYTES // 4, np.float32).tobytes()))
         time.sleep(0.1)
@@ -1012,6 +1013,68 @@ class OscOutputTests(unittest.TestCase):
         self.assertEqual([st["PBG_SS%d" % b] for b in (1, 2, 4)], [False] * 3)
         self.assertFalse(st["PBG_SSNegative"])
         self.assertEqual([st["PBG_Pos%d" % b] for b in (1, 2)], [False, True])  # neutral = middle (0.5 -> 2)
+
+
+class LightweightTests(unittest.TestCase):
+    """Optimisations must not change behaviour."""
+
+    def test_idle_rate_until_something_receives_the_output(self):
+        class FakeRuntime:
+            def activate(self): pass
+            def release(self): pass
+            def warmup(self): pass
+            def describe(self): return "fake"
+            def predict(self, sample): return np.array([0.1, 0.5], np.float32)
+
+        cfg = Config(face_port=0, eye_port=0, vrcft_port=0,
+                     classes=[ExpressionClass("n"), ExpressionClass("s", target="JawOpen")])
+        engine = Engine(cfg).start()
+        self.addCleanup(engine.stop)
+        engine._make_runtime = lambda: FakeRuntime()
+        stop = threading.Event()
+
+        def feed():
+            while not stop.is_set():
+                engine.hub.push(neural(1.0), neural(1.0))
+                time.sleep(1 / 60)
+        threading.Thread(target=feed, daemon=True).start()
+        self.addCleanup(stop.set)
+        engine.start_inference()
+        time.sleep(2.5)
+        self.assertTrue(engine.status()["idle"])
+        self.assertLess(engine.infer_rate.rate(), 13)  # ~10 Hz while nothing listens
+        self.assertGreater(engine.infer_rate.rate(), 6)
+        self.assertIsNotNone(engine.last_out.get(1))  # the GUI still gets values
+        engine.request_full_rate(2.5)  # e.g. the sensitivity measurement
+        time.sleep(2.2)
+        self.assertGreater(engine.infer_rate.rate(), 40)
+        self.assertFalse(engine.status()["idle"])
+        time.sleep(2.5)
+        self.assertTrue(engine.status()["idle"])  # back to idle afterwards
+        vr = socket.create_connection(("127.0.0.1", engine.vrcft.port))  # VRCFT module connects
+        self.addCleanup(vr.close)
+        vr.sendall(b"PBG2\x02")
+        self.assertTrue(wait_for(lambda: not engine.status()["idle"], timeout=3))
+        time.sleep(2.2)
+        self.assertGreater(engine.infer_rate.rate(), 45)  # full rate
+
+    def test_camera_frames_only_kept_while_shown(self):
+        hub = FrameHub()
+        rx = SRanipalReceiver(hub, "127.0.0.1", 0, 0).start()
+        self.addCleanup(rx.stop)
+        eye = socket.create_connection(("127.0.0.1", rx.ports[1]))
+        self.addCleanup(eye.close)
+        cam = packet(np.full(20000, 0.5, np.float32).tobytes())
+        eye.sendall(cam + packet(neural(1.0)))
+        self.assertTrue(wait_for(lambda: rx.status["port1"].last_frame > 0))
+        self.assertIsNone(hub.cameras["eye"])  # nobody shows a preview: not copied
+        hub.want_cameras()
+        eye.sendall(cam)
+        self.assertTrue(wait_for(lambda: hub.cameras["eye"] is not None))
+
+    def test_normalize_without_numpy_matches(self):
+        for raw, mp in ((0.45, 0.9), (5.0, 0.9), (-1.0, 0.9), (np.float32(0.3), 0.5)):
+            self.assertAlmostEqual(normalize(raw, mp), float(np.clip(raw / mp * 2 - 1, -1, 1)), places=6)
 
 
 class ConfigTests(unittest.TestCase):

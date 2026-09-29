@@ -60,6 +60,13 @@ def gray_to_photo(img):
     return tk.PhotoImage(data=data, format="PPM")
 
 
+def zoom_into(target, img, factor):
+    """Draw a small grayscale image into an existing PhotoImage, scaled by Tk. About 5x cheaper
+    than scaling in numpy and creating a new PhotoImage per frame (measured 1.6 vs 9 ms)."""
+    small = gray_to_photo(img)
+    target.tk.call(target, "copy", small, "-zoom", factor, factor)
+
+
 def format_row(parent, row, app, fmt_var, bits_var):
     """OSC format (float / binary / both) + binary resolution widgets on one grid row."""
     t = app.t
@@ -518,6 +525,7 @@ class App:
             self._error(t("sens_need_tracking"))
             return
         self._sens_auto = {"index": self.sens_class, "samples": [], "end": time.monotonic() + 5.0}
+        self.engine.request_full_rate(5.5)  # every frame, even before VRCFaceTracking is connected
         self._sens_auto_tick()
 
     def _sens_auto_tick(self):
@@ -1031,6 +1039,9 @@ class App:
             self._rebuild_bars()
 
     def _refresh_status(self):
+        if self._minimized():  # nothing to draw; check back once a second
+            self.root.after(1000, self._refresh_status)
+            return
         s = self.engine.status()
         t = self.t
         mode = s["input_mode"]
@@ -1072,7 +1083,8 @@ class App:
         elif s["inferring"]:
             self.infer_btn.configure(text=t("stop_infer"))
             self.infer_stats.configure(text=t("infer_stats") % (s["infer_fps"], s["latency_ms"],
-                                                                s["infer_backend"] or "-", s["process_cpu"]))
+                                                                s["infer_backend"] or "-", s["process_cpu"])
+                                       + ("  ·  " + t("idle_note") if s.get("idle") else ""))
         else:
             self.infer_btn.configure(text=t("start_infer"))
             self.infer_stats.configure(text=t("not_tracking"))
@@ -1100,8 +1112,15 @@ class App:
             cv.coords(hi, w * c.in_max - 1, 0, w * c.in_max - 1, 16)
             txt.configure(text="%.2f → %.2f" % (before, after))
 
+    def _minimized(self):
+        try:
+            return self.root.state() == "iconic"
+        except tk.TclError:
+            return True
+
     def _refresh_preview(self):
-        if self.show_preview.get() and self.nb.index("current") == 0:
+        if self.show_preview.get() and self.nb.index("current") == 0 and not self._minimized():
+            self.engine.hub.want_cameras()  # receivers only keep camera frames while shown
             cams = self.engine.hub.cameras
             mode = self.cfg.input_mode
             img = np.zeros((200, 200), dtype=np.uint8)
@@ -1109,10 +1128,10 @@ class App:
                 img[:100] = decode_camera(cams["eye"])
             if cams.get("face") is not None and mode in ("both", "face"):
                 img[100:] = decode_camera(cams["face"], flipped=True)
-            if PREVIEW_SCALE > 1:
-                img = img.repeat(PREVIEW_SCALE, 0).repeat(PREVIEW_SCALE, 1)
-            self._photo = gray_to_photo(img)
-            self.preview.itemconfigure(self.preview_image, image=self._photo)
+            if self._photo is None:
+                self._photo = tk.PhotoImage(width=200 * PREVIEW_SCALE, height=200 * PREVIEW_SCALE)
+                self.preview.itemconfigure(self.preview_image, image=self._photo)
+            zoom_into(self._photo, img, PREVIEW_SCALE)
         self.root.after(66, self._refresh_preview)
 
     def _draw_loss(self):

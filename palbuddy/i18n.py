@@ -139,6 +139,7 @@ STRINGS = {
                    "CPU %와 ms는 낮을수록 좋습니다. GPU를 측정하면 재시작 전까지 VRAM 일부가 점유됩니다."),
     "bench_line": ("%-18s %6.2f ms  CPU %3.0f%%", "%-18s %6.2f ms  CPU %3.0f%%"),
     "not_tracking": ("Not tracking", "트래킹 중 아님"),
+    "idle_note": ("idle 10 Hz: nothing receives the output yet", "대기 10Hz: 아직 출력을 받는 곳이 없음"),
     "preparing": ("Preparing model…", "모델 준비 중…"),
     "rec_name": ("Recording name", "녹화 이름"),
     "rec_frames": ("Frames", "프레임 수"),

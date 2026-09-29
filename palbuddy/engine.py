@@ -12,8 +12,6 @@ import tempfile
 import threading
 import time
 
-import numpy as np
-
 from . import onnx_runtime
 from .config import Config, binary_bits, class_output_problems, merged_param_problems, osc_output_names
 from .datasets import Recorder, convert_legacy_pickles
@@ -24,9 +22,15 @@ from .vrcft import VRCFTServer
 log = logging.getLogger(__name__)
 
 
+PLAN_REFRESH = 0.5  # s: how often the loop re-reads output settings (changes apply within this)
+IDLE_INTERVAL = 0.1  # s: inference rate cap while nothing receives the output (VRCFT off, no OSC outputs)
+
+
 def normalize(raw, max_power):
-    """Map a raw network output to VRCFT's -1..1 range (same formula as before)."""
-    return float(np.clip((raw / max_power) * 2.0 - 1.0, -1.0, 1.0))
+    """Map a raw network output to VRCFT's -1..1 range (same formula as before).
+    Plain Python: np.clip on a scalar costs ~20 us, and this runs per class per frame."""
+    v = float(raw) / max_power * 2.0 - 1.0
+    return -1.0 if v < -1.0 else (1.0 if v > 1.0 else v)
 
 
 class Engine:
@@ -63,6 +67,9 @@ class Engine:
         self._osc_plan = []
         self._bool_state = {}  # OSC bool name -> last value sent
         self._bool_refresh = 0.0
+        self._flag_names = {}  # (name, bits, signed) -> binary bool names
+        self.idle = False  # inference throttled because nothing receives the output
+        self._full_rate_until = 0.0  # e.g. while the GUI measures sensitivity
         self._smoothed = {}
 
     # ------------------------------------------------------------ lifecycle
@@ -121,16 +128,20 @@ class Engine:
         if fmt in ("float", "both"):
             self.osc.send_parameter(name, float(value))
         if fmt in ("binary", "both"):
-            flags = [("%s%d" % (name, 1 << i), b) for i, b in enumerate(binary_bits(binary_value, bits))]
+            names = self._flag_names.get((name, bits, signed))
+            if names is None:
+                names = self._flag_names[(name, bits, signed)] = osc_output_names(name, "binary", bits, signed)
+            values = binary_bits(binary_value, bits)
             if signed:
-                flags.append((name + "Negative", bool(negative)))
-            for flag, b in flags:
-                if force or self._bool_state.get(flag) != b:
+                values.append(bool(negative))
+            state = self._bool_state
+            for flag, b in zip(names, values):
+                if force or state.get(flag) != b:
                     self.osc.send_parameter(flag, b)
-                    self._bool_state[flag] = b
+                    state[flag] = b
 
     def _send_osc(self, weights, merged, force=False):
-        for kind, obj in self.osc_plan():
+        for kind, obj in self._osc_plan:
             if kind == "class":
                 w = weights.get(obj.name, 0.0)
                 self._send_output(obj.osc_name, obj.osc_format, obj.osc_bits, w, w, False, False, force)
@@ -139,9 +150,14 @@ class Engine:
                 mag, neg = obj.binary_input_of(value) if obj.osc_format != "float" else (0.0, False)
                 self._send_output(obj.name, obj.osc_format, obj.osc_bits, value, mag, neg, obj.signed, force)
 
+    def request_full_rate(self, seconds):
+        """Suspend the idle rate for a while (measurements want every frame)."""
+        self._full_rate_until = time.monotonic() + seconds
+
     def _send_merged_neutral(self):
         """Tracking stopped: leave every OSC output at its neutral value, not frozen."""
         if self.osc is not None and self.cfg.osc_enabled:
+            self.osc_plan()
             neutral = {m.name: m.neutral for m in self.active_merged_params()}
             self._send_osc({}, neutral, force=True)
         self.last_merged = {}
@@ -215,6 +231,7 @@ class Engine:
             "busy": self.busy,
             "fastcal": self.fastcal_state,
             "device": str(self._device) if self._device is not None else None,
+            "idle": self.idle and self.inferring and time.monotonic() >= self._full_rate_until,
             "model_loaded": self.model is not None or self.inferring,
             "model_dirty": self.model_dirty,
             "swapped": self.cfg.swapped,
@@ -516,6 +533,8 @@ class Engine:
         infer_interval = 1.0 / cfg.max_infer_rate if cfg.max_infer_rate > 0 else 0.0
         next_due = 0.0
         last_send = 0.0
+        plan_at = -PLAN_REFRESH
+        classes, targets, merged_params, interval = [], [], [], infer_interval
         waiting_logged = False
         log.info("Inference started (%s%s)", self.infer_backend,
                  ", max %.0f Hz" % cfg.max_infer_rate if infer_interval else "")
@@ -528,12 +547,29 @@ class Engine:
                     log.exception("fastcal failed")
                 self.fastcal_state = None
                 continue
-            if infer_interval:
+            now = time.monotonic()
+            if now - plan_at >= PLAN_REFRESH:
+                # output settings, re-read periodically instead of per frame
+                plan_at = now
+                classes = list(cfg.classes)
+                targets = [(idx, classes[idx].name, target) for idx, target, _ in cfg.targets() if idx < len(classes)]
+                self.osc_plan()
+                merged_params = self.active_merged_params()
+                consumer = (targets and self.vrcft.connected) or (cfg.osc_enabled and self._osc_plan)
+                if self.idle != (not consumer):
+                    self.idle = not consumer
+                    log.info("Nothing receives the output: tracking at 10 Hz until VRCFaceTracking connects or "
+                             "an OSC output is set up" if self.idle else "Output connected: tracking at full rate")
+            interval = max(infer_interval, IDLE_INTERVAL) if self.idle and now >= self._full_rate_until \
+                else infer_interval
+            if interval:
                 # rate cap: sleep until the next slot, then take the newest frame
                 # (frames in between are skipped, not queued)
-                delay = next_due - time.monotonic()
-                if delay > 0 and self._infer_stop.wait(delay):
+                delay = next_due - now
+                if delay > 0 and self._infer_stop.wait(min(delay, PLAN_REFRESH)):
                     break
+                if delay > PLAN_REFRESH:
+                    continue
             # Only run the network on *new* frames (the old loop re-ran on the
             # same frame every 10ms and slept even when a new frame was ready).
             seq, sample = self.hub.wait_next(seq, timeout=0.5)
@@ -551,18 +587,19 @@ class Engine:
             # smoothed so the display is readable; first value taken as is
             self.infer_latency_ms = ms if not self.infer_latency_ms else self.infer_latency_ms * 0.9 + ms * 0.1
             self.infer_rate.tick()
-            if infer_interval:
-                next_due = max(next_due + infer_interval, time.monotonic())
+            if interval:
+                next_due = max(next_due + interval, time.monotonic())
             self.last_raw = raw
 
             # per-class weight 0..1 (raw / max_power), smoothed; VRCFT gets 2w-1 in -1..1
-            alpha = self.cfg.smoothing
-            classes = self.cfg.classes
+            alpha = cfg.smoothing
+            raw_values = raw.tolist()  # Python floats: much faster than indexing numpy per element
             weights, class_raw, final = {}, {}, {}
             for idx, c in enumerate(classes):
-                if idx >= len(raw):
+                if idx >= len(raw_values):
                     break
-                w_raw = (normalize(raw[idx], c.max_power) + 1.0) / 2.0
+                r = raw_values[idx] / c.max_power
+                w_raw = 0.0 if r < 0.0 else (1.0 if r > 1.0 else r)
                 class_raw[idx] = w_raw
                 w = c.remap(w_raw)  # sensitivity range, e.g. 0.2..0.8 -> 0..1
                 if 0.0 < alpha < 1.0:
@@ -573,19 +610,19 @@ class Engine:
                 final[idx] = w
             self.last_class_raw, self.last_weights = class_raw, final
             out, pairs = {}, []
-            for idx, target, _ in self.cfg.targets():
-                if classes[idx].name in weights:
-                    v = weights[classes[idx].name] * 2.0 - 1.0
+            for idx, name, target in targets:
+                if name in weights:
+                    v = weights[name] * 2.0 - 1.0
                     out[idx] = v
                     pairs.append((target, v))
             self.last_out = out
-            merged = {m.name: m.combine(weights) for m in self.active_merged_params()}
+            merged = {m.name: m.combine(weights) for m in merged_params}
             self.last_merged = merged
             now = time.monotonic()
             if now - last_send >= min_interval:
                 if pairs:
                     self.vrcft.send_targets(pairs)
-                if self.cfg.osc_enabled:
+                if cfg.osc_enabled and self._osc_plan:
                     refresh = now - self._bool_refresh > 1.0  # resend all bools now and then
                     if refresh:
                         self._bool_refresh = now

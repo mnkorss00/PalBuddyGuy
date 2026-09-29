@@ -23,7 +23,7 @@ from .net import Disconnected, close_quietly, make_listener, recv_exact, tune_st
 
 log = logging.getLogger(__name__)
 
-from .params import legacy_index, unified_targets, unified_weights
+from .params import TRANSFORMS, legacy_index, unified_targets
 
 MSG_PARAMS = 2
 MSG_TABLE = 5
@@ -232,6 +232,9 @@ class VRCFTServer:
         self._table = tuple(table)
         self._slots = {u: i for i, u in enumerate(table)}  # unified name -> slot
         self._known = set(names)
+        # per target: (slots, scale, offset), so a frame is only a little arithmetic
+        self._compiled = {n: (tuple(self._slots[u] for u in unified_targets(n)),) + TRANSFORMS.get(n, (1.0, 0.0))
+                          for n in names}
         self._table_sent = False
 
     def send_targets(self, pairs):
@@ -258,8 +261,15 @@ class VRCFTServer:
         packet = b""
         if not self._table_sent:
             packet += encode_table(self._table, self.max_mode)
-        slot_weights = [(self._slots[u], uw) for name, v in pairs
-                        for u, uw in unified_weights(name, (float(v) + 1.0) / 2.0)]
+        slot_weights = []
+        compiled = self._compiled
+        for name, v in pairs:
+            slots, scale, offset = compiled[name]
+            w = (v + 1.0) * 0.5  # -1..1 -> 0..1, then the target's transform (same as params.unified_weights)
+            w = 0.0 if w < 0.0 else (1.0 if w > 1.0 else w)
+            uw = min(1.0, offset + scale * w) if w > 0.0 else 0.0
+            for slot in slots:
+                slot_weights.append((slot, uw))
         packet += encode_weights(slot_weights)
         ok = self.send_packet(packet)
         if ok:

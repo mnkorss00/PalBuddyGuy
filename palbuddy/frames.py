@@ -112,7 +112,16 @@ class FrameHub:
         self._listeners = []
         self._listeners_lock = threading.Lock()
         self.cameras = {"eye": None, "face": None}  # latest raw camera payloads
+        self.cameras_wanted_until = 0.0  # camera frames are only kept while someone shows them
         self.sample_rate = RateMeter()
+
+    def want_cameras(self, seconds=1.0):
+        """Call periodically while a camera preview is visible."""
+        self.cameras_wanted_until = time.monotonic() + seconds
+
+    @property
+    def cameras_wanted(self):
+        return time.monotonic() < self.cameras_wanted_until
 
     def push(self, eye, face):
         with self._cond:
@@ -273,11 +282,12 @@ class SRanipalReceiver:
                     log.warning("Invalid packet length %d on port %d, dropping connection", length, self.ports[index])
                     break
                 recv_exact_into(conn, payload_view[:length])
+                if length == CAMERA_BYTES:
+                    if self.hub.cameras_wanted:  # skip the 80 KB copy when no preview is shown
+                        self.hub.cameras[self.effective_role(index)] = bytes(payload_view[:length])
+                    continue
                 data = bytes(payload_view[:length])
                 role = self.effective_role(index)
-                if length == CAMERA_BYTES:
-                    self.hub.cameras[role] = data
-                    continue
                 st.last_frame = time.monotonic()
                 st.fps.tick(st.last_frame)
                 mode = self.mode

@@ -146,6 +146,38 @@ class MappingTests(unittest.TestCase):
                 self.assertIn(u, UNIFIED_EXPRESSIONS)
 
 
+class CompiledSendTests(unittest.TestCase):
+    def test_send_path_equals_unified_weights(self):
+        """VRCFTServer precompiles the mapping; what goes over the wire must equal
+        params.unified_weights for every target (up to the 16-bit wire resolution)."""
+        from palbuddy.params import all_target_names
+        srv = VRCFTServer("127.0.0.1", 0).start()
+        self.addCleanup(srv.stop)
+        c = socket.create_connection(("127.0.0.1", srv.port))
+        self.addCleanup(c.close)
+        c.sendall(b"PBG2\x02")
+        c.settimeout(3)
+        self.assertTrue(wait_for(lambda: srv.protocol == 2))
+        names = all_target_names()
+        table = None
+        for v in (-1.0, -0.4, 0.0, 0.3, 1.0):
+            self.assertTrue(srv.send_targets([(n, v) for n in names]))
+            msg = read_message(c)
+            if msg[0] == "table":
+                table = msg[2]
+                msg = read_message(c)
+            got = {}
+            for slot, w in msg[1]:
+                got[table[slot]] = max(got.get(table[slot], 0.0), w)  # module keeps the max per shape
+            expected = {}
+            for n in names:
+                for u, uw in unified_weights(n, (v + 1.0) / 2.0):
+                    expected[u] = max(expected.get(u, 0.0), uw)
+            self.assertEqual(set(got), set(expected))
+            for u in expected:
+                self.assertAlmostEqual(got[u], expected[u], delta=1 / 65535 + 1e-9, msg=(u, v))
+
+
 class InstallerTests(unittest.TestCase):
     def test_install_uninstall(self):
         tmp = tempfile.TemporaryDirectory()
