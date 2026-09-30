@@ -3,7 +3,7 @@ This project improves on the tracking of the Vive Pro Eye and the Vive Facial Tr
 
 It now comes with a GUI, and one process handles receiving data, recording, training, calibration and output.
 
-> 한국어 요약은 [아래](#한국어-빠른-시작)에 있습니다.
+> 한국어 전체 번역: [README.ko.md](README.ko.md) · 한국어 요약은 [아래](#한국어-빠른-시작)에 있습니다.
 
 # System requirements
 * An NVIDIA GPU with CUDA and at least 4 GB of VRAM is recommended. The code also runs on CPU (and Apple MPS), but training will be slow.
