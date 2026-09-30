@@ -1330,6 +1330,17 @@ class IntensityLearningTests(unittest.TestCase):
         D.remove_recording(path)
         self.assertFalse(os.path.exists(D.labels_path(path)))
 
+    def test_recording_names_never_overwrite(self):
+        from palbuddy.engine import unique_recording_name
+        cfg = Config(dataset_folder=self.tmp.name)
+        self.assertEqual(unique_recording_name(cfg, "smile"), "smile-em.mmap")
+        open(os.path.join(self.tmp.name, "smile-em.mmap"), "wb").close()
+        self.assertEqual(unique_recording_name(cfg, "smile"), "smile-2-em.mmap")
+        open(os.path.join(self.tmp.name, "smile-2-em.mmap.labels.json"), "w").close()  # labels count as taken
+        self.assertEqual(unique_recording_name(cfg, "smile"), "smile-3-em.mmap")
+        open(os.path.join(self.tmp.name, "raw.mmap"), "wb").close()
+        self.assertEqual(unique_recording_name(cfg, "raw.mmap"), "raw-2.mmap")
+
     def test_soft_targets_and_mixup(self):
         from palbuddy.trainer import BatchSampler, targets_for
         np.testing.assert_allclose(targets_for(1, np.array([0.25], np.float32), 3), [[0.75, 0.25, 0.0]])

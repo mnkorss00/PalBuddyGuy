@@ -458,7 +458,9 @@ class Engine:
         name = name.strip()
         if not name:
             raise ValueError("Enter a dataset name")
-        filename = name if name.endswith(".mmap") else name + "-em.mmap"
+        filename = unique_recording_name(self.cfg, name)
+        if filename != (name if name.endswith(".mmap") else name + "-em.mmap"):
+            log.info("A recording named '%s' already exists; saving as %s", name, filename)
         path = self.cfg.dataset_path(filename)
         self.busy = "recording"
 
@@ -908,6 +910,23 @@ class Engine:
             self.cfg.classes[idx].max_power = round(value, 4)
         self.save_config()
         log.info("FastCal finished: %s", {self.cfg.classes[i].name: round(v, 4) for i, v in results.items()})
+
+
+def unique_recording_name(cfg, name):
+    """File name for a new recording that never overwrites an existing one:
+    "smile" -> smile-em.mmap, then smile-2-em.mmap, smile-3-em.mmap, ...
+    ("smile.mmap" -> smile.mmap, smile-2.mmap, ...)."""
+    stem, suffix = (name[:-5], ".mmap") if name.endswith(".mmap") else (name, "-em.mmap")
+
+    def taken(filename):
+        path = cfg.dataset_path(filename)
+        return any(os.path.exists(p) for p in (path, path + ".part", path + ".labels.json"))
+
+    filename, n = stem + suffix, 2
+    while taken(filename):
+        filename = "%s-%d%s" % (stem, n, suffix)
+        n += 1
+    return filename
 
 
 def dataset_files(cfg):
