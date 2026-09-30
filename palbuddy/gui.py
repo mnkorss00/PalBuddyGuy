@@ -9,6 +9,7 @@ import locale
 import logging
 import os
 import queue
+import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -17,7 +18,7 @@ import numpy as np
 
 from .config import (LOSSES, MAX_BINARY_BITS, MODEL_ARCHS, OSC_FORMATS, RANGE_PRESETS, ExpressionClass,
                      MergedParam, MergedTerm, class_output_problems, merged_param_problems)
-from .datasets import frame_count
+from .datasets import frame_count, labels_path, remove_recording
 from .engine import STABILITY_WINDOW, dataset_files
 from .frames import decode_camera
 from .i18n import Translator
@@ -330,11 +331,45 @@ class MergedDialog(tk.Toplevel):
         self.destroy()
 
 
+class GuideSound:
+    """Beeps while a guided recording runs, so it can be followed with the headset on:
+    silence = neutral face, the higher the pitch the stronger the expression."""
+
+    def __init__(self):
+        self.target = 0.0
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        try:
+            import winsound  # noqa: F401  (Windows only)
+        except ImportError:
+            return
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="guide-sound")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self.target = 0.0
+
+    def _run(self):
+        import winsound
+        while not self._stop.is_set():
+            v = self.target
+            if v > 0.02:
+                winsound.Beep(int(300 + 700 * v), 70)  # blocks for the beep's length
+                self._stop.wait(0.05)
+            else:
+                self._stop.wait(0.1)
+
+
 class CompareDialog(tk.Toplevel):
     """Train several model / loss combinations on the same recordings, show how each
     does on the held-out frames and how fast it runs here, and apply the one picked."""
 
-    COLUMNS = ("loss", "score", "acc", "hit", "false", "ms", "size")
+    COLUMNS = ("loss", "score", "acc", "hit", "false", "err", "ms", "size")
 
     def __init__(self, app):
         super().__init__(app.root)
@@ -442,7 +477,8 @@ class CompareDialog(tk.Toplevel):
             name = ("★ " if i == best else "") + self.app.arch_labels[r["arch"]]
             self.tree.insert("", "end", iid=str(i), text=name, tags=("best",) if i == best else (), values=(
                 r["loss"].upper(), "%.1f" % m["val_score"], "%.1f%%" % (m["val_acc"] * 100),
-                "%.1f%%" % (m["val_hit"] * 100), "%.1f%%" % (m["val_false"] * 100), "%.2f" % r["ms"],
+                "%.1f%%" % (m["val_hit"] * 100), "%.1f%%" % (m["val_false"] * 100), "%.2f" % m.get("val_err", 0),
+                "%.2f" % r["ms"],
                 "%.1f" % r["size_mb"]))
             if current and i != best:
                 self.tree.item(str(i), text=name + " " + t("compare_current"))
@@ -774,8 +810,20 @@ class App:
             row=0, column=5, padx=6)
         self.rec_btn = ttk.Button(form, text=t("record"), command=self.on_record)
         self.rec_btn.grid(row=0, column=6, padx=(12, 4))
-        ttk.Button(form, text=t("cancel"), command=self.engine.cancel_record).grid(row=0, column=7)
+        self.guided_btn = ttk.Button(form, text=t("record_guided"), command=lambda: self.on_record(guided=True))
+        self.guided_btn.grid(row=0, column=7, padx=(0, 4))
+        ttk.Button(form, text=t("cancel"), command=self.engine.cancel_record).grid(row=0, column=8)
         ttk.Label(tab, text=t("rec_help"), foreground="#666", wraplength=900).pack(anchor="w", pady=6)
+        ttk.Label(tab, text=t("guided_help"), foreground="#666", wraplength=900, justify="left").pack(
+            anchor="w", pady=(0, 6))
+        guide = ttk.Frame(tab)
+        guide.pack(fill="x", pady=(0, 6))
+        self.guide_canvas = tk.Canvas(guide, height=46, bg="white", highlightthickness=1,
+                                      highlightbackground="#ccc")
+        self.guide_canvas.pack(side="left", fill="x", expand=True)
+        self.guide_cue = ttk.Label(guide, text="", width=26, font=("TkDefaultFont", 14, "bold"))
+        self.guide_cue.pack(side="left", padx=8)
+        self.guide_sound = GuideSound()
         self.rec_progress = ttk.Progressbar(tab, maximum=1.0)
         self.rec_progress.pack(fill="x")
         self.rec_status = ttk.Label(tab, text="")
@@ -783,11 +831,13 @@ class App:
 
         box = ttk.LabelFrame(tab, text=t("recordings"), padding=6)
         box.pack(fill="both", expand=True)
-        cols = ("frames", "size")
+        cols = ("frames", "size", "guided")
         self.rec_tree = ttk.Treeview(box, columns=cols, show="tree headings", selectmode="extended")
         self.rec_tree.heading("#0", text=t("col_name"))
         self.rec_tree.heading("frames", text=t("rec_frames"))
         self.rec_tree.heading("size", text="MB")
+        self.rec_tree.heading("guided", text=t("col_guided"))
+        self.rec_tree.column("guided", width=70, anchor="center")
         self.rec_tree.column("frames", width=90, anchor="e")
         self.rec_tree.column("size", width=90, anchor="e")
         self.rec_tree.pack(side="left", fill="both", expand=True)
@@ -847,6 +897,8 @@ class App:
         ttk.Checkbutton(opts2, text=t("amp"), variable=self.amp).pack(side="left")
         ttk.Checkbutton(opts2, text=t("cache"), variable=self.cache).pack(side="left", padx=12)
         ttk.Checkbutton(opts2, text=t("resume"), variable=self.resume).pack(side="left")
+        self.mixup = tk.BooleanVar(value=self.cfg.mixup)
+        ttk.Checkbutton(opts2, text=t("mixup"), variable=self.mixup).pack(side="left", padx=12)
         opts3 = ttk.Frame(tab)
         opts3.pack(fill="x", pady=(0, 6))
         self.arch_labels = {a: t("arch_" + a) for a in MODEL_ARCHS}
@@ -1191,7 +1243,21 @@ class App:
         self.rec_progress["value"] = done / max(1, total)
         self.rec_status.configure(text="%s  %d / %d" % (phase, done, total))
 
+    def _ev_guide(self, value, cue, left):
+        self.guide_sound.target = value if cue != "done" else 0.0
+        cv = self.guide_canvas
+        cv.delete("all")
+        w, h = cv.winfo_width(), cv.winfo_height()
+        cv.create_rectangle(0, 0, w * value, h, fill="#2e9d4f", width=0)
+        for mark in (0.5, 1.0):
+            cv.create_line(w * mark - 1, 0, w * mark - 1, h, fill="#999", dash=(3, 3))
+        self.guide_cue.configure(text=self.t("cue_" + cue) if cue != "done" else "")
+
     def _ev_rec_done(self, ok, message, filename):
+        self.guide_sound.stop()
+        self.guide_canvas.delete("all")
+        self.guide_cue.configure(text="")
+        self.guided_btn.state(["!disabled"])
         self.rec_status.configure(text=message)
         self.rec_btn.state(["!disabled"])
         self.refresh_recordings()
@@ -1358,7 +1424,8 @@ class App:
             path = self.cfg.dataset_path(f)
             try:
                 size = os.path.getsize(path)
-                self.rec_tree.insert("", "end", iid=f, text=f, values=(frame_count(path), "%.0f" % (size / 2**20)))
+                self.rec_tree.insert("", "end", iid=f, text=f, values=(
+                    frame_count(path), "%.0f" % (size / 2**20), "✓" if os.path.exists(labels_path(path)) else ""))
             except OSError:
                 pass
 
@@ -1410,15 +1477,19 @@ class App:
         except Exception as e:
             self._error(e)
 
-    def on_record(self):
+    def on_record(self, guided=False):
         try:
             self.cfg.record_frames = int(self.rec_frames.get())
             self.cfg.record_countdown = float(self.rec_countdown.get())
             self.engine.record(
                 self.rec_name.get(),
                 on_progress=lambda d, n, p: self.events.put(("rec_progress", d, n, p)),
-                on_done=lambda ok, m, f: self.events.put(("rec_done", ok, m, f)))
+                on_done=lambda ok, m, f: self.events.put(("rec_done", ok, m, f)),
+                guided=guided, on_guide=lambda v, cue, left: self.events.put(("guide", v, cue, left)))
             self.rec_btn.state(["disabled"])
+            self.guided_btn.state(["disabled"])
+            if guided:
+                self.guide_sound.start()
             self.engine.save_config()
         except Exception as e:
             self._error(e)
@@ -1454,7 +1525,7 @@ class App:
         for f in self.rec_tree.selection():
             if messagebox.askyesno(self.t("delete"), self.t("confirm_delete") % f, parent=self.root):
                 try:
-                    os.remove(self.cfg.dataset_path(f))
+                    remove_recording(self.cfg.dataset_path(f))
                 except OSError as e:
                     self._error(e)
         self.refresh_recordings()
@@ -1520,6 +1591,7 @@ class App:
         self.cfg.learning_rate = float(self.lr.get())
         self.cfg.mixed_precision = bool(self.amp.get())
         self.cfg.cache_datasets_in_ram = bool(self.cache.get())
+        self.cfg.mixup = bool(self.mixup.get())
         self.cfg.model_arch = next(a for a, text in self.arch_labels.items() if text == self.arch_var.get())
         self.cfg.loss = next(k for k, text in self.loss_labels.items() if text == self.loss_var.get())
 

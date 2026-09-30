@@ -501,11 +501,11 @@ class LiteAndValidationTests(unittest.TestCase):
     def test_split_holds_out_the_tail(self):
         from palbuddy.trainer import split_recordings
         rec = np.arange(100, dtype=np.float32)[:, None, None, None] * np.ones((1, 128, 20, 20), np.float32)
-        train_recs, vx, vy = split_recordings([[rec], [rec]], 0.1, slice(0, 128))
+        train_recs, _, vx, vt = split_recordings([[rec], [rec]], 0.1, slice(0, 128))
         self.assertEqual(len(train_recs[0][0]), 90)
         self.assertTrue((vx[:, 0, 0, 0] >= 90).all())  # only frames the model never trains on
-        self.assertEqual(sorted(set(vy.tolist())), [0, 1])
-        self.assertIsNone(split_recordings([[rec]], 0, slice(0, 128))[1])
+        self.assertEqual(sorted(set(vt.argmax(axis=1).tolist())), [0, 1])
+        self.assertIsNone(split_recordings([[rec]], 0, slice(0, 128))[2])
 
     def test_train_lite_with_validation(self):
         tmp = tempfile.TemporaryDirectory()
@@ -515,7 +515,7 @@ class LiteAndValidationTests(unittest.TestCase):
                      validation_split=0.2, classes=[ExpressionClass("neutral", ["n.mmap"]),
                                                     ExpressionClass("smile", ["s.mmap"], "JawOpen")])
         seen = []
-        model, _ = train(cfg, log_fn=lambda *a: None, device=torch.device("cpu"),
+        model, _ = train(cfg, log_fn=lambda *a: None, device=torch.device("cpu"), seed=0,
                          on_progress=lambda **i: seen.append(i) if i.get("epoch_done") else None)
         self.assertEqual(model.arch, "lite")
         self.assertIn("val_acc", seen[-1])
@@ -1186,7 +1186,12 @@ class CompactModelAndCompareTests(unittest.TestCase):
         x[1] = 1
         m = evaluate(Fixed(out), x, np.array([0, 1]), 2, torch.device("cpu"))
         self.assertEqual((m["acc"], m["hit"], m["false"]), (1.0, 0.5, 0.5))
-        self.assertAlmostEqual(m["score"], 100 * (1 + 0.5 + 2 * 0.5) / 4)
+        self.assertAlmostEqual(m["err"], (0.1 + 0.6) / 2, places=6)
+        self.assertAlmostEqual(m["score"], 100 * (1 + 0.5 + 2 * 0.5 + (1 - 0.35)) / 5, places=4)
+        # soft targets (guided recording): frame 1 shows class 1 at 40% -> no "clear" frame for hit,
+        # and class 0 (target 0.6) outputting 0.35 is not a false activation
+        m = evaluate(Fixed(out), x, np.array([[1.0, 0.0], [0.6, 0.4]], np.float32), 2, torch.device("cpu"))
+        self.assertEqual((m["hit"], m["false"]), (1.0, 0.0))
 
     def test_recommend_prefers_fast_among_equals(self):
         from palbuddy.trainer import recommend
@@ -1279,6 +1284,101 @@ class CompactModelAndCompareTests(unittest.TestCase):
         cfg = self._cfg(validation_split=0.0)
         with self.assertRaises(ValueError):
             compare(cfg, [("lite", "mse")], log_fn=lambda *a: None, device=torch.device("cpu"))
+
+
+class IntensityLearningTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_guide_script(self):
+        from palbuddy.datasets import GUIDE_DURATION, guide_target
+        self.assertEqual(guide_target(0.5)[:2], (0.0, "neutral"))
+        self.assertAlmostEqual(guide_target(2.5)[0], 0.5)  # halfway up the first ramp
+        self.assertEqual(guide_target(4.0)[:2], (1.0, "hold"))
+        self.assertEqual(guide_target(GUIDE_DURATION + 1)[1], "done")
+        vals = [guide_target(t / 10)[0] for t in range(int(GUIDE_DURATION * 10))]
+        self.assertEqual((min(vals), max(vals)), (0.0, 1.0))
+        self.assertTrue(any(abs(v - 0.5) < 1e-6 for v in vals))  # half-strength holds
+
+    def test_guided_recording_writes_labels(self):
+        from palbuddy import datasets as D
+        script = ((0.3, 0.0, 0.0, "neutral"), (0.4, 0.0, 1.0, "up"), (0.3, 1.0, 1.0, "hold"))
+        old = D.GUIDE_SCRIPT, D.GUIDE_DURATION, D.GUIDE_LAG
+        D.GUIDE_SCRIPT, D.GUIDE_DURATION, D.GUIDE_LAG = script, 1.0, 0.0
+        self.addCleanup(lambda: setattr(D, "GUIDE_SCRIPT", old[0]) or setattr(D, "GUIDE_DURATION", old[1])
+                        or setattr(D, "GUIDE_LAG", old[2]))
+        hub = FrameHub()
+        path = os.path.join(self.tmp.name, "smile-em.mmap")
+        done, result, cues = threading.Event(), {}, []
+        D.Recorder(hub, path, 0, countdown=0, guided=True, on_guide=lambda v, cue, left: cues.append(cue),
+                   on_done=lambda ok, m: (result.update(ok=ok, m=m), done.set())).start()
+        stop = time.time() + 1.3
+        while time.time() < stop and not done.is_set():
+            hub.push(neural(1.0), neural(1.0))
+            time.sleep(1 / 200)
+        self.assertTrue(done.wait(5))
+        self.assertTrue(result["ok"], result["m"])
+        n = frame_count(path)
+        self.assertGreater(n, 64)
+        labels = D.load_labels(path, n)
+        self.assertEqual(len(labels), n)
+        self.assertEqual(labels[0], 0.0)
+        self.assertGreater(labels.max(), 0.9)
+        self.assertIn("up", cues)
+        self.assertIsNone(D.load_labels(path, n + 1))  # mismatched labels are ignored
+        D.remove_recording(path)
+        self.assertFalse(os.path.exists(D.labels_path(path)))
+
+    def test_soft_targets_and_mixup(self):
+        from palbuddy.trainer import BatchSampler, targets_for
+        np.testing.assert_allclose(targets_for(1, np.array([0.25], np.float32), 3), [[0.75, 0.25, 0.0]])
+        np.testing.assert_allclose(targets_for(0, None, 3), [[1, 0, 0]])
+        neutral = np.zeros((20, 128, 20, 20), np.float32)
+        smile = np.ones((20, 128, 20, 20), np.float32)
+        lab = np.linspace(0, 1, 20).astype(np.float32)
+        plain = BatchSampler([[neutral], [smile]], 256, seed=0)
+        x, t = plain.sample()
+        self.assertTrue(set(np.unique(t)) <= {0.0, 1.0})
+        guided = BatchSampler([[neutral], [smile]], 256, seed=0, labels=[[None], [lab]])
+        x, t = guided.sample()
+        np.testing.assert_allclose(t.sum(axis=1), 1.0, atol=1e-6)
+        self.assertTrue(((t > 0.01) & (t < 0.99)).any())
+        mixed = BatchSampler([[neutral], [smile]], 512, seed=0, mixup=0.5)
+        x, t = mixed.sample()
+        blended = (t[:, 1] > 0.01) & (t[:, 1] < 0.99)
+        self.assertGreater(blended.sum(), 50)
+        # inputs are blended with exactly the target's weight (neutral frames are 0, smile frames 1)
+        np.testing.assert_allclose(x[blended, 0, 0, 0], t[blended, 1], atol=1e-6)
+
+    def test_training_uses_guided_labels(self):
+        import json
+        from palbuddy.datasets import labels_path
+        make_recordings(self.tmp.name, {"n": 0.0, "s": 1.0}, frames=64)
+        with open(labels_path(os.path.join(self.tmp.name, "s.mmap")), "w") as f:
+            json.dump({"intensity": np.linspace(0, 1, 64).round(3).tolist()}, f)
+        cfg = Config(dataset_folder=self.tmp.name, epochs=2, batch_size=32, mixed_precision=False,
+                     model_arch="compact", loss="bce", validation_split=0.2,
+                     classes=[ExpressionClass("neutral", ["n.mmap"]), ExpressionClass("smile", ["s.mmap"], "JawOpen")])
+        logs = []
+        model, _ = train(cfg, log_fn=logs.append, device=torch.device("cpu"), seed=0)
+        self.assertTrue(any("1 guided" in line for line in logs), logs[:3])
+        self.assertIn("val_err", model.val_metrics)
+
+    def test_one_euro_smoothing(self):
+        from palbuddy.engine import OneEuro, smoothing_cutoff
+        self.assertIsNone(smoothing_cutoff(0.0))
+        self.assertGreater(smoothing_cutoff(0.2), smoothing_cutoff(0.8))
+        rng = np.random.default_rng(0)
+        f, t, out = OneEuro(), 0.0, []
+        for _ in range(120):  # 2 s of jitter around 0.3
+            t += 1 / 60
+            out.append(f.update(0.3 + rng.normal(0, 0.05), t, smoothing_cutoff(0.6)))
+        self.assertLess(np.std(out[30:]), 0.02)
+        for _ in range(12):  # a real, fast movement to 1.0 comes through within 0.2 s
+            t += 1 / 60
+            v = f.update(1.0, t, smoothing_cutoff(0.6))
+        self.assertGreater(v, 0.85)
 
 
 if __name__ == "__main__":

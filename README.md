@@ -101,6 +101,17 @@ Tracking runs the network on every new frame, about 60 times a second. These set
 
 Every run keeps the weights of the epoch that did best on the held-out frames, so training too long doesn't hurt.
 
+### Guided recording and intensity learning (Record / Train tab)
+Blendshape trackers such as Project Babble are trained on *continuous* labels (how strong each shape is), not on "this is expression X". Pal Buddy Guy's original recordings only say "this whole file is expression X", which makes a model jump between 0 and 1 and lets it confuse the time of recording with the expression. Two additions close that gap:
+
+* **Guided recording** (Record tab, recommended for every expression, ~36 s): a green bar and beeps (for use with the headset on; Windows) tell you how strong to make the expression: silence = neutral, higher pitch = stronger. The script ramps to full, holds, returns to neutral, goes to half strength and back, three times. Every frame gets its intensity as a label (shifted by 0.3 s for reaction time, stored next to the recording as `.labels.json`). A guided frame at intensity *v* is trained as *v* × expression + (1 − *v*) × neutral. Because each guided recording contains neutral stretches from the same session, the model can't tell expressions apart by when they were recorded.
+* **Mixup** (Train tab, on by default): half of the expression samples are blended with a random neutral frame, `x = λ·expr + (1 − λ)·neutral`, targets blended the same way. This teaches in-between intensities even from plain recordings.
+
+Guided and plain recordings can be mixed in a class. The validation metrics use the soft targets, so the comparison's *Int. error* shows how well each model follows intensity.
+
+### Smoothing (Live tab)
+*Smoothing* is a 1-Euro filter, the filter Project Babble and VRCFaceTracking use: small jitter is smoothed strongly, fast real movements pass with little lag. Around the middle of the slider it matches Babble's default (min cutoff ≈ 3 Hz, β 0.9).
+
 ### Compare models & pick (Train tab)
 **Compare models & pick…** trains the selected combinations (by default standard/lite/compact with MSE and BCE) on the same recordings with the same sampling, scores each on the held-out frames and times it on this PC with your inference settings. The table shows:
 
@@ -109,7 +120,8 @@ Every run keeps the weights of the epoch that did best on the held-out frames, s
 | Accuracy | the shown expression has the highest output |
 | Recognised | the shown expression's output is above 0.5 |
 | False act. | another expression's output is above 0.3, i.e. a wrong shape would move (lower is better) |
-| Score | (accuracy + recognised + 2 × (100 % − false act.)) / 4 |
+| Int. error | mean distance between the output and the target intensity of the shown expression (guided recordings make this meaningful) |
+| Score | (accuracy + recognised + 2 × (100 % − false act.) + (1 − int. error)) / 5 |
 | ms/frame, MB | tracking cost on this PC |
 
 The recommended row is marked ★: the highest score, and among models within 0.5 points of it the fastest. Select any row and press **Apply selected model** (or double-click it): it becomes the current model at once, is saved to the model file (the previous file is kept as `<name>.prev.pt`), the Train tab's choices are updated, and tracking restarts with it if it was running. CLI: `compare`, `arch`, `loss`.
@@ -231,5 +243,6 @@ If you want the receiver in its own process, run `python tvm_proxy.py` and set t
 11. **OSC 직접 출력**: 병합 파라미터 탭에서 **여러 클래스를 가중치로** 합치거나(예: 웃음 × 1 + 슬픔 × -1, 넓힘 × 0.2 + 뜸 × 0.8 + 찡그림 × -1; 범위 -1~1 / 0~1 / 0~2 / 직접 입력, **중간값 직접 설정**), 학습 탭의 클래스 설정에서 *OSC 파라미터* 이름을 지정해 클래스 값(0~1)을 VRChat에 직접 보낼 수 있습니다. 형식은 **float / 바이너리 / 둘 다** 중에서 고르고, 바이너리는 **1~8비트**로 VRCFT 바이너리와 같은 방식입니다. **VRCFT가 쓰는 이름(v1/v2, 바이너리, `/이름` 경로 포함)은 사용할 수 없게 막아서** 기존 페이셜에 영향이 가지 않습니다. `PBG_SmileSad`처럼 고유한 이름을 쓰세요.
 12. **민감도 (실시간 탭)**: 출력 목록에서 클래스를 클릭하고 하한/상한 슬라이더를 조정하면, 예를 들어 0.2~0.8로만 움직이는 값을 0~1로 늘립니다. *자동 (5초)*을 누르고 무표정 → 최대 표정을 지으면 범위를 자동으로 잡아 줍니다.
 13. **말할 때 감정이 출렁이면**: 무표정으로 글을 소리 내어 읽는 녹화(30초, 다른 날 한 번 더)를 만들어 **대상 없는 `talk` 클래스**로 추가하고 다시 학습하세요. 근본 해결책입니다. 추가로 실시간 탭에서 감정 클래스를 클릭하고 **안정화** 슬라이더를 올리면 짧은 출렁임(최대 400ms 미만)을 무시합니다. 입 모양 클래스에는 끄세요.
+14. **가이드 녹화 (녹화 탭, 표정마다 권장)**: 초록 막대와 비프음(소리 없음 = 무표정, 음이 높을수록 강하게)을 따라 약 36초 동안 표정을 지으면, 프레임마다 **강도 정답**이 저장됩니다. Project Babble처럼 표정의 **세기**를 학습해서 0↔1로 튀지 않고, 녹화마다 같은 착용 상태의 무표정이 들어가 착용 차이에도 강해집니다. 학습 탭의 **중간 강도 학습 (mixup)**은 기본으로 켜져 있고, 일반 녹화로도 중간 강도를 배우게 합니다. 스무딩은 Babble·VRCFT와 같은 **1-Euro 필터**입니다.
 
 언어는 설정 탭에서 바꿀 수 있습니다 (auto / en / ko).

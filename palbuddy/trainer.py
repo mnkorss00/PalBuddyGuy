@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from .config import LOSSES, channels_for
-from .datasets import open_recording
+from .datasets import load_labels, open_recording
 from .model import BuddyNet, pick_device
 
 log = logging.getLogger(__name__)
@@ -31,20 +31,44 @@ class TrainingCancelled(Exception):
     pass
 
 
+NEUTRAL = 0  # the first class is the neutral face (the GUI and README require it)
+
+
+def targets_for(c, values, num_classes):
+    """Target rows for frames of class `c`. values: per-frame intensity from a guided
+    recording (None = the whole recording shows the expression fully). A guided
+    frame at intensity v is v * class + (1 - v) * neutral."""
+    n = len(values) if values is not None else 1
+    t = np.zeros((n, num_classes), dtype=np.float32)
+    if values is None or c == NEUTRAL:
+        t[:, c] = 1.0
+    else:
+        t[:, c] = values
+        t[:, NEUTRAL] += 1.0 - values
+    return t
+
+
 class BatchSampler:
-    def __init__(self, recordings_per_class, batch_size, seed=None, channels=slice(0, 128)):
+    """Uniform class, uniform file within the class, uniform frame within the file.
+
+    mixup: fraction of the non-neutral samples blended with a random neutral frame,
+    x = l * x_expr + (1 - l) * x_neutral with the targets blended the same way
+    (l uniform in 0..1). It teaches in-between intensities from recordings that only
+    show the full expression, and keeps the model from jumping between 0 and 1."""
+
+    def __init__(self, recordings_per_class, batch_size, seed=None, channels=slice(0, 128), labels=None,
+                 mixup=0.0):
         self.classes = recordings_per_class  # list[list[array (N,128,20,20)]]
+        self.labels = labels or [[None] * len(recs) for recs in recordings_per_class]
         self.batch_size = batch_size
         self.channels = channels  # only the tracker(s) in use are read from disk
         self.rng = np.random.default_rng(seed)
         self.num_classes = len(recordings_per_class)
         self.eye = np.eye(self.num_classes, dtype=np.float32)
+        self.mixup = mixup if self.num_classes > 1 else 0.0
 
-    def sample(self):
-        b = self.batch_size
-        cls = self.rng.integers(0, self.num_classes, size=b)
+    def _gather(self, cls, x, t):
         ch = self.channels
-        x = np.empty((b, ch.stop - ch.start, 20, 20), dtype=np.float32)
         for c in np.unique(cls):
             slots = np.nonzero(cls == c)[0]
             recs = self.classes[c]
@@ -55,7 +79,26 @@ class BatchSampler:
                 idx = self.rng.integers(0, len(rec), size=len(s))
                 order = np.argsort(idx)  # sequential-ish disk access for memmaps
                 x[s[order]] = rec[idx[order], ch]
-        return x, self.eye[cls]
+                lab = self.labels[c][f]
+                t[s[order]] = targets_for(c, None if lab is None else lab[idx[order]], self.num_classes)
+
+    def sample(self):
+        b = self.batch_size
+        cls = self.rng.integers(0, self.num_classes, size=b)
+        ch = self.channels
+        x = np.empty((b, ch.stop - ch.start, 20, 20), dtype=np.float32)
+        t = np.empty((b, self.num_classes), dtype=np.float32)
+        self._gather(cls, x, t)
+        if self.mixup > 0:
+            mix = np.nonzero((cls != NEUTRAL) & (self.rng.random(b) < self.mixup))[0]
+            if len(mix):
+                nx = np.empty((len(mix),) + x.shape[1:], dtype=np.float32)
+                nt = np.empty((len(mix), self.num_classes), dtype=np.float32)
+                self._gather(np.full(len(mix), NEUTRAL), nx, nt)
+                lam = self.rng.random(len(mix)).astype(np.float32)
+                x[mix] = lam[:, None, None, None] * x[mix] + (1 - lam[:, None, None, None]) * nx
+                t[mix] = lam[:, None] * t[mix] + (1 - lam[:, None]) * nt
+        return x, t
 
 
 def check_recording(rec, channels, path):
@@ -72,30 +115,37 @@ def check_recording(rec, channels, path):
 VAL_FRAMES_PER_FILE = 32
 
 
-def split_recordings(recordings, fraction, channels):
+def split_recordings(recordings, fraction, channels, labels=None):
     """Hold out the *end* of every recording for validation.
 
     Neighbouring frames are nearly identical, so a random split would leak;
     a contiguous tail measures how well the model handles moments it hasn't
-    seen. Returns (train recordings, val_x, val_class) - val arrays may be empty."""
+    seen. Returns (train recordings, train labels, val_x, val_targets); the val
+    arrays are None when nothing could be held out."""
+    num_classes = len(recordings)
+    labels = labels or [[None] * len(recs) for recs in recordings]
     if fraction <= 0:
-        return recordings, None, None
-    train, xs, ys = [], [], []
+        return recordings, labels, None, None
+    train, train_labels, xs, ts = [], [], [], []
     for c, recs in enumerate(recordings):
-        kept = []
-        for rec in recs:
+        kept, kept_labels = [], []
+        for rec, lab in zip(recs, labels[c]):
             n_train = int(len(rec) * (1 - fraction))
             if n_train < 16 or len(rec) - n_train < 4:
                 kept.append(rec)  # too short to split
+                kept_labels.append(lab)
                 continue
             kept.append(rec[:n_train])
+            kept_labels.append(None if lab is None else lab[:n_train])
             idx = np.linspace(n_train, len(rec) - 1, num=min(VAL_FRAMES_PER_FILE, len(rec) - n_train)).astype(int)
             xs.append(np.ascontiguousarray(rec[idx, channels]))
-            ys.append(np.full(len(idx), c))
+            ts.append(targets_for(c, None if lab is None else lab[idx], num_classes) if lab is not None
+                      else np.repeat(targets_for(c, None, num_classes), len(idx), axis=0))
         train.append(kept)
+        train_labels.append(kept_labels)
     if not xs:
-        return train, None, None
-    return train, np.concatenate(xs), np.concatenate(ys)
+        return train, train_labels, None, None
+    return train, train_labels, np.concatenate(xs), np.concatenate(ts)
 
 
 HIT_THRESHOLD = 0.5  # the shown expression's output counts as recognised above this
@@ -103,38 +153,49 @@ FALSE_THRESHOLD = 0.3  # another class's output counts as a false activation abo
 
 
 @torch.no_grad()
-def evaluate(model, val_x, val_y, num_classes, device, batch=256):
-    """Metrics on the held-out frames (outputs compared with one-hot targets):
-      loss        MSE (same scale for every model, so runs are comparable)
-      acc         the shown expression has the highest output
-      hit         the shown expression's output is above HIT_THRESHOLD
-      false       some *other* class's output is above FALSE_THRESHOLD (a wrong shape moves)
+def evaluate(model, val_x, val_t, num_classes, device, batch=256):
+    """Metrics on the held-out frames. val_t: target rows (N x classes, soft for guided
+    recordings) or class indices (N,) meaning one-hot targets.
+      loss        MSE against the targets (same scale for every model, so runs are comparable)
+      acc         the expression with the largest target has the highest output
+      hit         on frames where the expression is clearly shown (target >= 0.75),
+                  its output is above HIT_THRESHOLD
+      false       some class whose target is ~0 has an output above FALSE_THRESHOLD
+                  (a wrong shape moves)
+      err         mean |output - target| of the shown expression (how well intensity is followed)
       per_class   acc per class
       score       one number to rank models, see score()
     """
+    val_t = np.asarray(val_t)
+    if val_t.ndim == 1:
+        val_t = np.eye(num_classes, dtype=np.float32)[val_t]
     was_training = model.training
     model.eval()
-    eye = torch.eye(num_classes, device=device)
-    loss_sum = 0.0
-    correct, hits, falses = np.zeros(num_classes), np.zeros(num_classes), np.zeros(num_classes)
-    counts = np.bincount(val_y, minlength=num_classes).astype(float)
+    cls_all = val_t.argmax(axis=1)
+    loss_sum = err_sum = 0.0
+    correct = np.zeros(num_classes)
+    hits, clear, falses = 0.0, 0.0, 0.0
+    counts = np.bincount(cls_all, minlength=num_classes).astype(float)
     for i in range(0, len(val_x), batch):
         x = torch.from_numpy(val_x[i:i + batch]).to(device)
-        y = torch.from_numpy(val_y[i:i + batch]).to(device)
+        target = torch.from_numpy(np.ascontiguousarray(val_t[i:i + batch], dtype=np.float32)).to(device)
         pred = model(x).float()
-        target = eye[y]
+        cls = target.argmax(dim=1)
         loss_sum += float(((pred - target) ** 2).mean(dim=1).sum())
-        ys = val_y[i:i + batch]
-        np.add.at(correct, ys, (pred.argmax(dim=1) == y).cpu().numpy())
-        own = pred.gather(1, y[:, None])[:, 0]
-        np.add.at(hits, ys, (own > HIT_THRESHOLD).cpu().numpy())
-        others = pred.masked_fill(target.bool(), 0.0).max(dim=1).values
-        np.add.at(falses, ys, (others > FALSE_THRESHOLD).cpu().numpy())
+        np.add.at(correct, cls_all[i:i + batch], (pred.argmax(dim=1) == cls).cpu().numpy())
+        own = pred.gather(1, cls[:, None])[:, 0]
+        own_t = target.gather(1, cls[:, None])[:, 0]
+        err_sum += float((own - own_t).abs().sum())
+        shown = own_t >= 0.75
+        clear += float(shown.sum())
+        hits += float(((own > HIT_THRESHOLD) & shown).sum())
+        others = pred.masked_fill(target > 0.05, 0.0).max(dim=1).values
+        falses += float((others > FALSE_THRESHOLD).sum())
     if was_training:
         model.train()
     total = counts.sum()
-    m = {"loss": loss_sum / len(val_x), "acc": float(correct.sum() / total), "hit": float(hits.sum() / total),
-         "false": float(falses.sum() / total),
+    m = {"loss": loss_sum / len(val_x), "acc": float(correct.sum() / total),
+         "hit": hits / clear if clear else 0.0, "false": falses / total, "err": err_sum / total,
          "per_class": [float(c / n) if n else float("nan") for c, n in zip(correct, counts)]}
     m["score"] = score(m)
     return m
@@ -142,8 +203,9 @@ def evaluate(model, val_x, val_y, num_classes, device, batch=256):
 
 def score(m):
     """0..100. False activations weigh double: a wrong shape moving is more visible
-    on the avatar than a correct one moving a bit less."""
-    return 100.0 * (m["acc"] + m["hit"] + 2.0 * (1.0 - m["false"])) / 4.0
+    on the avatar than a correct one moving a bit less. The intensity error counts
+    once, so a model that follows guided intensities closely ranks higher."""
+    return 100.0 * (m["acc"] + m["hit"] + 2.0 * (1.0 - m["false"]) + (1.0 - min(1.0, m["err"]))) / 5.0
 
 
 NORM_FRAMES = 4096
@@ -169,10 +231,10 @@ def input_statistics(recordings, channels, seed=0):
 
 def load_recordings(cfg, log_fn=print):
     channels = channels_for(cfg.input_mode)
-    recordings = []
-    total = 0
+    recordings, labels = [], []
+    total = guided = 0
     for c in cfg.classes:
-        recs = []
+        recs, labs = [], []
         for name in c.files:
             path = cfg.dataset_path(name)
             try:
@@ -180,15 +242,21 @@ def load_recordings(cfg, log_fn=print):
             except FileNotFoundError:
                 raise FileNotFoundError("Recording '%s' of class '%s' not found" % (path, c.name))
             check_recording(rec, channels, path)
+            lab = load_labels(path, len(rec))
+            guided += lab is not None
             recs.append(rec)
+            labs.append(lab)
             total += len(rec)
         if not recs:
             raise ValueError("Class '%s' has no recordings" % c.name)
         recordings.append(recs)
-    log_fn("Loaded %d recordings (%d frames) for %d classes" % (sum(map(len, recordings)), total, len(recordings)))
-    return recordings, total
+        labels.append(labs)
+    log_fn("Loaded %d recordings (%d frames, %d guided) for %d classes" % (
+        sum(map(len, recordings)), total, guided, len(recordings)))
+    return recordings, labels, total
 
 
+MIXUP_FRACTION = 0.5  # share of expression samples blended with neutral when cfg.mixup is on
 OUTPUT_FOR_LOSS = {"mse": "relu", "bce": "sigmoid"}
 # the compact net (fewer weights, standardised input) needs a larger step to train in the same epochs
 ARCH_LR_SCALE = {"compact": 10.0}
@@ -198,9 +266,10 @@ class Data:
     """Recordings split into training frames and held-out validation frames."""
 
     def __init__(self, cfg, log_fn=print):
-        recordings, self.total_frames = load_recordings(cfg, log_fn)
+        recordings, labels, self.total_frames = load_recordings(cfg, log_fn)
         self.channels = channels_for(cfg.input_mode)
-        self.recordings, self.val_x, self.val_y = split_recordings(recordings, cfg.validation_split, self.channels)
+        self.recordings, self.labels, self.val_x, self.val_t = split_recordings(
+            recordings, cfg.validation_split, self.channels, labels)
         if self.val_x is not None:
             log_fn("Holding out %d frames (end of each recording) for validation" % len(self.val_x))
         self._stats = None
@@ -225,7 +294,7 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
         raise ValueError("loss must be one of %s" % ", ".join(LOSSES))
 
     data = data or Data(cfg, log_fn)
-    recordings, val_x, val_y, channels = data.recordings, data.val_x, data.val_y, data.channels
+    recordings, val_x, val_t, channels = data.recordings, data.val_x, data.val_t, data.channels
     if init_model is not None:
         model = init_model
         if model.output != OUTPUT_FOR_LOSS[loss_name]:
@@ -272,7 +341,8 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
 
     def producer(seed):
         pin = device.type == "cuda"
-        sampler = BatchSampler(recordings, cfg.batch_size, seed=seed, channels=channels)
+        sampler = BatchSampler(recordings, cfg.batch_size, seed=seed, channels=channels, labels=data.labels,
+                               mixup=MIXUP_FRACTION if cfg.mixup else 0.0)
         try:
             while not producer_stop.is_set():
                 x, y = sampler.sample()
@@ -321,16 +391,16 @@ def train(cfg, on_progress=None, stop_event=None, log_fn=print, init_model=None,
             history.append(avg)
             val = {}
             if val_x is not None:
-                m = evaluate(model, val_x, val_y, cfg.num_classes, device)
+                m = evaluate(model, val_x, val_t, cfg.num_classes, device)
                 val = {"val_loss": m["loss"], "val_acc": m["acc"], "val_hit": m["hit"], "val_false": m["false"],
-                       "val_score": m["score"]}
+                       "val_err": m["err"], "val_score": m["score"]}
                 if best is None or m["score"] > best[0]:
                     names = [c.name for c in cfg.classes]
                     metrics = dict(val, per_class=dict(zip(names, m["per_class"])), epoch=epoch + 1)
                     best = (m["score"], metrics, {k: v.detach().clone() for k, v in model.state_dict().items()})
                 log_fn("Epoch %d/%d  avg loss %.6f  val: accuracy %.1f%%  recognised %.1f%%  false %.1f%%  "
-                       "score %.1f" % (epoch + 1, cfg.epochs, avg, m["acc"] * 100, m["hit"] * 100,
-                                       m["false"] * 100, m["score"]))
+                       "intensity error %.2f  score %.1f" % (epoch + 1, cfg.epochs, avg, m["acc"] * 100,
+                                                             m["hit"] * 100, m["false"] * 100, m["err"], m["score"]))
             else:
                 log_fn("Epoch %d/%d  avg loss %.6f" % (epoch + 1, cfg.epochs, avg))
             on_progress(epoch=epoch + 1, epochs=cfg.epochs, step=steps, steps=steps, loss=avg, avg=avg,

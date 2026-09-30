@@ -60,6 +60,47 @@ def softener(temperature):
     return soften
 
 
+class OneEuro:
+    """1-Euro filter (Casiez et al.), the smoothing Project Babble and VRCFaceTracking use:
+    a low-pass whose cutoff rises with the speed of change, so small jitter is smoothed
+    strongly while real, fast movements pass with little lag."""
+
+    __slots__ = ("x", "dx", "last")
+
+    D_CUTOFF = 1.0
+    BETA = 0.9  # Babble's default speed coefficient
+
+    def __init__(self):
+        self.x = None
+        self.dx = 0.0
+        self.last = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        r = 2.0 * math.pi * cutoff * dt
+        return r / (r + 1.0)
+
+    def update(self, v, now, min_cutoff):
+        if self.x is None:
+            self.x, self.last = v, now
+            return v
+        dt = max(1e-4, now - self.last)
+        self.last = now
+        dx = (v - self.x) / dt
+        self.dx += (dx - self.dx) * self._alpha(self.D_CUTOFF, dt)
+        cutoff = min_cutoff + self.BETA * abs(self.dx)
+        self.x += (v - self.x) * self._alpha(cutoff, dt)
+        return self.x
+
+
+def smoothing_cutoff(smoothing):
+    """Smoothing slider (0..0.9) -> 1-Euro min cutoff in Hz: 0.5 ~ 2.8 Hz (Babble uses 3),
+    0.9 ~ 0.4 Hz. None = off."""
+    if smoothing <= 0.0:
+        return None
+    return 0.3 + 10.0 * (1.0 - smoothing) ** 2
+
+
 STABILITY_WINDOW = 0.4  # s: median window at stability 1 (a syllable is ~0.1-0.25 s)
 STABILITY_TAU = 0.3  # s: low-pass time constant at stability 1
 
@@ -409,7 +450,9 @@ class Engine:
         return self.model
 
     # ------------------------------------------------------------ recording
-    def record(self, name, on_progress=None, on_done=None, frames=None):
+    def record(self, name, on_progress=None, on_done=None, frames=None, guided=False, on_guide=None):
+        """guided: follow the on-screen / beeped intensity script (datasets.GUIDE_SCRIPT);
+        the recording gets per-frame intensity labels."""
         if self.busy:
             raise RuntimeError("Already %s" % self.busy)
         name = name.strip()
@@ -427,7 +470,7 @@ class Engine:
                 on_done(ok, message, filename)
 
         self._recorder = Recorder(self.hub, path, frames or self.cfg.record_frames, self.cfg.record_countdown,
-                                  on_progress, done).start()
+                                  on_progress, done, guided=guided, on_guide=on_guide).start()
         return filename
 
     def cancel_record(self):
@@ -762,7 +805,7 @@ class Engine:
             self.last_raw = raw
 
             # per-class weight 0..1 (raw / max_power), smoothed; VRCFT gets 2w-1 in -1..1
-            alpha = cfg.smoothing
+            cutoff = smoothing_cutoff(cfg.smoothing)
             frame_time = time.monotonic()
             raw_values = raw.tolist()  # Python floats: much faster than indexing numpy per element
             weights, class_raw, final = {}, {}, {}
@@ -778,10 +821,12 @@ class Engine:
                     if st is None:
                         st = self._stabilizers[idx] = Stabilizer()
                     w = st.update(w, frame_time, c.stability)
-                if 0.0 < alpha < 1.0:
-                    prev = self._smoothed.get(idx, w)
-                    w = prev * alpha + w * (1.0 - alpha)
-                    self._smoothed[idx] = w
+                if cutoff is not None:
+                    f = self._smoothed.get(idx)
+                    if f is None:
+                        f = self._smoothed[idx] = OneEuro()
+                    w = f.update(w, frame_time, cutoff)
+                    w = 0.0 if w < 0.0 else (1.0 if w > 1.0 else w)
                 weights[c.name] = w
                 final[idx] = w
             self.last_class_raw, self.last_weights = class_raw, final

@@ -60,6 +60,23 @@ STRINGS = {
     "sens_title_none": ("Sensitivity (click a class above)", "민감도 (위 목록에서 클래스를 클릭)"),
     "sens_title": ("Sensitivity: %s", "민감도: %s"),
     "sens_low": ("Low end", "하한"),
+    "record_guided": ("Guided recording", "가이드 녹화"),
+    "guided_help": ("Guided recording (recommended for expressions, ~36 s): follow the green bar and the beeps "
+                    "(no sound = neutral face, higher pitch = stronger). It ramps up, holds, goes back to neutral "
+                    "and to half strength, 3 times. The model then learns how strong the expression is, not only "
+                    "on/off, and every recording contains its own neutral frames.",
+                    "가이드 녹화 (표정 녹화에 권장, 약 36초): 초록 막대와 비프음을 따라 표정을 지으세요 (소리 없음 = "
+                    "무표정, 음이 높을수록 강하게). 서서히 최대 → 유지 → 무표정 → 절반 강도를 3번 반복합니다. 모델이 "
+                    "켜짐/꺼짐뿐 아니라 표정의 강도를 배우고, 녹화마다 같은 착용 상태의 무표정도 함께 들어갑니다."),
+    "col_guided": ("Guided", "가이드"),
+    "cue_neutral": ("Neutral face", "무표정"),
+    "cue_up": ("Slowly to full ↑", "천천히 최대로 ↑"),
+    "cue_hold": ("Hold full", "최대 유지"),
+    "cue_down": ("Slowly back ↓", "천천히 풀기 ↓"),
+    "cue_up_half": ("Slowly to half ↑", "천천히 절반까지 ↑"),
+    "cue_hold_half": ("Hold half", "절반 유지"),
+    "mixup": ("Learn in-between intensities (mixup)", "중간 강도 학습 (mixup)"),
+    "cmp_err": ("Int. error", "강도 오차"),
     "sens_stability": ("Stability", "안정화"),
     "stability_value": ("ignores < %.0f ms", "%.0f ms 미만 무시"),
     "stability_hint": ("Stability: ignores changes shorter than the shown time, e.g. emotions flickering while "
@@ -212,11 +229,14 @@ STRINGS = {
     "cmp_size": ("MB", "MB"),
     "compare_legend": ("Accuracy: the shown expression has the highest output. Recognised: its output is above 0.5. "
                        "False act.: another expression's output is above 0.3 (a wrong shape moves) - lower is "
-                       "better. Score = (accuracy + recognised + 2 × (100% - false act.)) / 4. Models within "
+                       "better. Int. error: how far the output is from the target intensity (guided recordings), "
+                       "lower is better. Score = (accuracy + recognised + 2 × (100% - false act.) + "
+                       "(1 - int. error)) / 5. Models within "
                        "0.5 points of the best count as equal and the fastest of them is recommended.",
                        "정확도: 보여준 표정의 출력이 가장 높은 비율. 인식률: 그 표정의 출력이 0.5를 넘은 비율. "
                        "오작동률: 다른 표정의 출력이 0.3을 넘은 비율 (엉뚱한 표정이 움직임, 낮을수록 좋음). "
-                       "점수 = (정확도 + 인식률 + 2 × (100% - 오작동률)) / 4. 최고점과 0.5점 이내면 같은 "
+                       "강도 오차: 목표 강도와 출력의 차이 (가이드 녹화, 낮을수록 좋음). "
+                       "점수 = (정확도 + 인식률 + 2 × (100% - 오작동률) + (1 - 강도 오차)) / 5. 최고점과 0.5점 이내면 같은 "
                        "수준으로 보고 그중 가장 빠른 모델을 추천합니다."),
     "compare_verdict": ("Recommended: %s + %s (score %.1f, %.2f ms per frame).",
                         "추천: %s + %s (점수 %.1f, 프레임당 %.2f ms)."),

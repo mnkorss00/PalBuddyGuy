@@ -240,10 +240,13 @@ class Config:
     # "mse": original (ReLU outputs, MSE against one-hot targets); "bce": sigmoid outputs
     # trained with binary cross-entropy, each class independent of the others
     loss: str = "mse"
+    # blend half of the expression samples with neutral frames (and their targets) so the
+    # model learns in-between intensities; see trainer.BatchSampler
+    mixup: bool = True
     validation_split: float = 0.1  # end of each recording held out to measure accuracy; 0 = off
 
     # Inference
-    smoothing: float = 0.0  # 0 = off, otherwise EMA factor in (0, 1)
+    smoothing: float = 0.0  # 0 = off .. 0.9 = strongest (1-Euro filter, see engine.smoothing_cutoff)
     # BCE (sigmoid) models only: 1 = off; higher = outputs follow the expression more
     # gradually instead of jumping between 0 and 1 (see engine.softener)
     softness: float = 1.0
